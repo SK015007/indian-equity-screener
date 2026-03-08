@@ -2,7 +2,7 @@
 
 import yfinance as yf
 import pandas as pd
-from config import HISTORY_DAYS, CRORE
+from src.config import HISTORY_DAYS, CRORE
 
 
 def fetch_bulk_price_data(symbols: list[str], period_days: int = HISTORY_DAYS) -> dict[str, pd.DataFrame]:

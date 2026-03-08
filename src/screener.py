@@ -16,15 +16,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import yfinance as yf
 
-from config import (
+from src.config import (
     MIN_MARKET_CAP_CR, MIN_SALES_GROWTH_PCT, MIN_PROFIT_GROWTH_PCT,
     MIN_ROE_PCT, MAX_DEBT_TO_EQUITY, MIN_PROMOTER_HOLDING_PCT,
     MAX_PLEDGED_PCT, MIN_AVG_TRADED_VALUE_CR, CRORE, MAX_WORKERS,
     EMA_LONG, NIFTY_REGIME_CHECK,
 )
-from stock_universe import fetch_nifty500_tickers
-from data_fetcher import fetch_bulk_price_data, fetch_fundamentals
-from technicals import screen_technical, calc_ema
+from src.stock_universe import fetch_nifty500_tickers
+from src.data_fetcher import fetch_bulk_price_data, fetch_fundamentals
+from src.technicals import screen_technical, calc_ema
 
 
 def _check_nifty_regime() -> tuple[bool, dict]:

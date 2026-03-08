@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 
-from config import (
+from src.config import (
     EMA_LONG, EMA_SHORT, CROSSOVER_LOOKBACK, VOLUME_MULTIPLIER,
     VOLUME_AVG_PERIOD, RSI_PERIOD, RSI_LOWER, RSI_UPPER, MAX_ABOVE_EMA_PCT,
     ADX_PERIOD, ADX_MIN, ATR_PERIOD, ATR_SL_MULTIPLIER,

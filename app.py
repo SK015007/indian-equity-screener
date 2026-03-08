@@ -15,7 +15,7 @@ import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from config import (
+from src.config import (
     EMA_LONG, EMA_SHORT, CROSSOVER_LOOKBACK, VOLUME_MULTIPLIER,
     VOLUME_AVG_PERIOD, RSI_PERIOD, RSI_LOWER, RSI_UPPER,
     MAX_ABOVE_EMA_PCT, ADX_MIN, ATR_SL_MULTIPLIER,
@@ -23,9 +23,9 @@ from config import (
     MIN_ROE_PCT, MAX_DEBT_TO_EQUITY, MIN_PROMOTER_HOLDING_PCT,
     MAX_PLEDGED_PCT, MIN_AVG_TRADED_VALUE_CR, CRORE, MAX_WORKERS,
 )
-from stock_universe import fetch_nifty500_tickers, fetch_nifty250_tickers
-from data_fetcher import fetch_bulk_price_data, fetch_fundamentals
-from technicals import screen_technical, screen_ema200_breakout, calc_ema, calc_rsi, calc_atr, calc_adx
+from src.stock_universe import fetch_nifty500_tickers, fetch_nifty250_tickers
+from src.data_fetcher import fetch_bulk_price_data, fetch_fundamentals
+from src.technicals import screen_technical, screen_ema200_breakout, calc_ema, calc_rsi, calc_atr, calc_adx
 
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
