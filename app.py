@@ -63,7 +63,7 @@ if is_swing:
 else:
     st.sidebar.subheader("Technical")
     f_max_above_ema = st.sidebar.slider("Max % above EMA200", 3.0, 25.0, 15.0, 0.5)
-    f_lookback = st.sidebar.slider("Crossover Lookback (days)", 5, 60, CROSSOVER_LOOKBACK)
+    f_lookback = st.sidebar.slider("Crossover Lookback (days)", 1, 7, 7)
 
 st.sidebar.subheader("Fundamental")
 f_mcap = st.sidebar.number_input("Min Market Cap (Cr)", 100, 50000, int(MIN_MARKET_CAP_CR), 100)
