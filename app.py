@@ -196,34 +196,22 @@ def check_fundamentals(fund: dict) -> tuple[bool, str]:
     if mcap < f_mcap:
         reasons.append(f"MCap Rs.{mcap} Cr < {f_mcap}")
     roe = fund.get("roe_pct")
-    if roe is None:
-        reasons.append("ROE: no data")
-    elif roe < f_roe:
+    if roe is not None and roe < f_roe:
         reasons.append(f"ROE {roe}% < {f_roe}%")
     de = fund.get("debt_to_equity")
-    if de is None:
-        reasons.append("D/E: no data")
-    elif de > f_de:
+    if de is not None and de > f_de:
         reasons.append(f"D/E {de} > {f_de}")
     sg = fund.get("sales_growth_pct")
-    if sg is None:
-        reasons.append("Sales growth: no data")
-    elif sg < f_sales_g:
+    if sg is not None and sg < f_sales_g:
         reasons.append(f"Sales growth {sg}% < {f_sales_g}%")
     pg = fund.get("profit_growth_pct")
-    if pg is None:
-        reasons.append("Profit growth: no data")
-    elif pg < f_profit_g:
+    if pg is not None and pg < f_profit_g:
         reasons.append(f"Profit growth {pg}% < {f_profit_g}%")
     ocf = fund.get("operating_cashflow_cr")
-    if ocf is None:
-        reasons.append("OCF: no data")
-    elif ocf <= 0:
+    if ocf is not None and ocf <= 0:
         reasons.append(f"OCF Rs.{ocf} Cr <= 0")
     promo = fund.get("promoter_holding_pct")
-    if promo is None:
-        reasons.append("Promoter holding: no data")
-    elif promo < f_promo:
+    if promo is not None and promo < f_promo:
         reasons.append(f"Promoter {promo}% < {f_promo}%")
     pledged = fund.get("pledged_pct")
     if pledged is not None and pledged > MAX_PLEDGED_PCT:
@@ -521,9 +509,11 @@ if st.button("Run Screener", type="primary", use_container_width=True):
 
                 fund = future.result()
                 if fund is None:
-                    miss_row = {"symbol": sym, "fail_reason": "No data"}
-                    miss_row.update(tech_passed[sym])
-                    near_miss.append(miss_row)
+                    # Fundamentals unavailable — still include with a note
+                    row = {"symbol": sym}
+                    row.update(tech_passed[sym])
+                    row["fund_note"] = "Fundamental data unavailable"
+                    final_results.append(row)
                     continue
 
                 passed, reason = check_fundamentals(fund)
