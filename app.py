@@ -22,10 +22,13 @@ from src.config import (
     MIN_MARKET_CAP_CR, MIN_SALES_GROWTH_PCT, MIN_PROFIT_GROWTH_PCT,
     MIN_ROE_PCT, MAX_DEBT_TO_EQUITY, MIN_PROMOTER_HOLDING_PCT,
     MAX_PLEDGED_PCT, MIN_AVG_TRADED_VALUE_CR, CRORE, MAX_WORKERS,
+    VCP_MAX_FROM_52W_HIGH_PCT, VCP_MIN_ABOVE_52W_LOW_PCT, VCP_BASE_LENGTH,
+    VCP_MIN_CONTRACTIONS, VCP_VOL_CONTRACTION_RATIO, VCP_BREAKOUT_VOL_MULT,
+    VCP_PIVOT_PROXIMITY_PCT,
 )
 from src.stock_universe import fetch_nifty500_tickers, fetch_nifty250_tickers
 from src.data_fetcher import fetch_bulk_price_data, fetch_fundamentals
-from src.technicals import screen_technical, screen_ema200_breakout, calc_ema, calc_rsi, calc_atr, calc_adx
+from src.technicals import screen_technical, screen_ema200_breakout, screen_vcp, calc_ema, calc_rsi, calc_atr, calc_adx
 
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -35,33 +38,137 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ── Custom CSS ───────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+    /* --- Global --- */
+    .block-container { padding-top: 1.5rem; }
+
+    /* --- Metric cards --- */
+    div[data-testid="stMetric"] {
+        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+        border: 1px solid #0f3460;
+        border-radius: 10px;
+        padding: 16px 20px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    }
+    div[data-testid="stMetric"] label {
+        color: #8892b0 !important;
+        font-size: 0.8rem !important;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }
+    div[data-testid="stMetric"] div[data-testid="stMetricValue"] {
+        color: #e6f1ff !important;
+        font-size: 1.8rem !important;
+        font-weight: 700;
+    }
+
+    /* --- Sidebar --- */
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #0d1117 0%, #161b22 100%);
+        border-right: 1px solid #21262d;
+    }
+    section[data-testid="stSidebar"] .stRadio > label,
+    section[data-testid="stSidebar"] .stSlider > label,
+    section[data-testid="stSidebar"] .stNumberInput > label {
+        color: #c9d1d9 !important;
+    }
+
+    /* --- Tables --- */
+    .stDataFrame {
+        border-radius: 8px;
+        overflow: hidden;
+    }
+
+    /* --- Buttons --- */
+    .stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, #0077b6 0%, #00b4d8 100%);
+        border: none;
+        border-radius: 8px;
+        font-weight: 600;
+        letter-spacing: 0.03em;
+        padding: 0.6rem 1.2rem;
+        transition: all 0.2s ease;
+    }
+    .stButton > button[kind="primary"]:hover {
+        background: linear-gradient(135deg, #00b4d8 0%, #90e0ef 100%);
+        box-shadow: 0 4px 15px rgba(0, 180, 216, 0.3);
+    }
+
+    /* --- Expander headers --- */
+    .streamlit-expanderHeader {
+        font-weight: 600;
+        font-size: 0.95rem;
+    }
+
+    /* --- Section headers --- */
+    h2 {
+        color: #e6f1ff !important;
+        border-bottom: 2px solid #0077b6;
+        padding-bottom: 0.3rem;
+    }
+    h3 {
+        color: #ccd6f6 !important;
+    }
+
+    /* --- Dividers --- */
+    hr {
+        border-color: #21262d !important;
+    }
+
+    /* --- Download button --- */
+    .stDownloadButton > button {
+        background: transparent;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        color: #58a6ff !important;
+        transition: all 0.2s ease;
+    }
+    .stDownloadButton > button:hover {
+        background: rgba(88, 166, 255, 0.1);
+        border-color: #58a6ff;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 # ── Sidebar Filters ──────────────────────────────────────────────────────────
 st.sidebar.title("Screener Filters")
 
 # Strategy selector
 STRATEGY_SWING = "Swing Trade (EMA Crossover + ADX)"
 STRATEGY_BREAKOUT = "EMA 200 Breakout (Nifty 250)"
+STRATEGY_VCP = "VCP - Volatility Contraction"
 strategy = st.sidebar.radio(
     "Strategy",
-    [STRATEGY_SWING, STRATEGY_BREAKOUT],
+    [STRATEGY_SWING, STRATEGY_BREAKOUT, STRATEGY_VCP],
     help="**Swing Trade**: Nifty 500, recent 200 EMA crossover with volume spike, RSI 50-70, ADX > 20.\n\n"
          "**EMA 200 Breakout**: Nifty 250, recent 200 EMA crossover + good fundamentals. "
-         "Less strict than swing (no RSI/ADX filters). Catches NMDC-type breakout moves.",
+         "Less strict than swing (no RSI/ADX filters). Catches NMDC-type breakout moves.\n\n"
+         "**VCP**: Minervini-style pattern. Stocks near 52W highs with tightening "
+         "price contractions and volume dry-up, ready to break out.",
 )
 
 is_swing = (strategy == STRATEGY_SWING)
+is_vcp = (strategy == STRATEGY_VCP)
 
-# Technical filters (only for Swing strategy)
+# Technical filters vary by strategy
+st.sidebar.subheader("Technical")
 if is_swing:
-    st.sidebar.subheader("Technical")
     f_rsi_lower = st.sidebar.slider("RSI Lower", 30, 60, RSI_LOWER)
     f_rsi_upper = st.sidebar.slider("RSI Upper", 60, 85, RSI_UPPER)
     f_adx_min = st.sidebar.slider("Min ADX", 10, 40, ADX_MIN)
     f_vol_mult = st.sidebar.slider("Volume Multiplier", 1.0, 5.0, VOLUME_MULTIPLIER, 0.1)
     f_max_above_ema = st.sidebar.slider("Max % above EMA200", 3.0, 15.0, MAX_ABOVE_EMA_PCT, 0.5)
     f_lookback = st.sidebar.slider("Crossover Lookback (days)", 2, 30, CROSSOVER_LOOKBACK)
+elif is_vcp:
+    f_vcp_max_from_high = st.sidebar.slider("Max % from 52W High", 5.0, 40.0, VCP_MAX_FROM_52W_HIGH_PCT, 1.0)
+    f_vcp_min_above_low = st.sidebar.slider("Min % above 52W Low", 10.0, 50.0, VCP_MIN_ABOVE_52W_LOW_PCT, 5.0)
+    f_vcp_base_length = st.sidebar.slider("Base Length (days)", 30, 180, VCP_BASE_LENGTH, 10)
+    f_vcp_vol_contraction = st.sidebar.slider("Vol Contraction Ratio", 0.3, 1.0, VCP_VOL_CONTRACTION_RATIO, 0.05)
+    f_vcp_pivot_proximity = st.sidebar.slider("Max % below Pivot", 1.0, 10.0, VCP_PIVOT_PROXIMITY_PCT, 0.5)
+    f_vcp_breakout_vol = st.sidebar.slider("Breakout Vol Multiplier", 1.0, 4.0, VCP_BREAKOUT_VOL_MULT, 0.1)
 else:
-    st.sidebar.subheader("Technical")
     f_max_above_ema = st.sidebar.slider("Max % above EMA200", 3.0, 25.0, 15.0, 0.5)
     f_lookback = st.sidebar.slider("Crossover Lookback (days)", 0, 7, 7)
 
@@ -79,30 +186,45 @@ f_adtv = st.sidebar.number_input("Min ADTV (Cr)", 1.0, 50.0, MIN_AVG_TRADED_VALU
 
 # ── Helper: check fundamentals with sidebar values ───────────────────────────
 def check_fundamentals(fund: dict) -> tuple[bool, str]:
+    reasons = []
     mcap = fund.get("market_cap_cr", 0)
     if mcap < f_mcap:
-        return False, f"MCap Rs.{mcap} Cr < {f_mcap}"
+        reasons.append(f"MCap Rs.{mcap} Cr < {f_mcap}")
     roe = fund.get("roe_pct")
-    if roe is not None and roe < f_roe:
-        return False, f"ROE {roe}% < {f_roe}%"
+    if roe is None:
+        reasons.append("ROE: no data")
+    elif roe < f_roe:
+        reasons.append(f"ROE {roe}% < {f_roe}%")
     de = fund.get("debt_to_equity")
-    if de is not None and de > f_de:
-        return False, f"D/E {de} > {f_de}"
+    if de is None:
+        reasons.append("D/E: no data")
+    elif de > f_de:
+        reasons.append(f"D/E {de} > {f_de}")
     sg = fund.get("sales_growth_pct")
-    if sg is not None and sg < f_sales_g:
-        return False, f"Sales growth {sg}% < {f_sales_g}%"
+    if sg is None:
+        reasons.append("Sales growth: no data")
+    elif sg < f_sales_g:
+        reasons.append(f"Sales growth {sg}% < {f_sales_g}%")
     pg = fund.get("profit_growth_pct")
-    if pg is not None and pg < f_profit_g:
-        return False, f"Profit growth {pg}% < {f_profit_g}%"
+    if pg is None:
+        reasons.append("Profit growth: no data")
+    elif pg < f_profit_g:
+        reasons.append(f"Profit growth {pg}% < {f_profit_g}%")
     ocf = fund.get("operating_cashflow_cr")
-    if ocf is not None and ocf <= 0:
-        return False, f"OCF Rs.{ocf} Cr <= 0"
+    if ocf is None:
+        reasons.append("OCF: no data")
+    elif ocf <= 0:
+        reasons.append(f"OCF Rs.{ocf} Cr <= 0")
     promo = fund.get("promoter_holding_pct")
-    if promo is not None and promo < f_promo:
-        return False, f"Promoter {promo}% < {f_promo}%"
+    if promo is None:
+        reasons.append("Promoter holding: no data")
+    elif promo < f_promo:
+        reasons.append(f"Promoter {promo}% < {f_promo}%")
     pledged = fund.get("pledged_pct")
     if pledged is not None and pledged > MAX_PLEDGED_PCT:
-        return False, f"Pledged {pledged}% > {MAX_PLEDGED_PCT}%"
+        reasons.append(f"Pledged {pledged}% > {MAX_PLEDGED_PCT}%")
+    if reasons:
+        return False, "; ".join(reasons)
     return True, ""
 
 
@@ -188,6 +310,20 @@ def screen_breakout_with_params(df: pd.DataFrame) -> dict | None:
     return screen_ema200_breakout(df, max_above_ema_pct=f_max_above_ema, lookback=f_lookback)
 
 
+# ── Helper: VCP screen with sidebar values ───────────────────────────────────
+def screen_vcp_with_params(df: pd.DataFrame) -> dict | None:
+    """VCP screen using sidebar filter values."""
+    return screen_vcp(
+        df,
+        max_from_high_pct=f_vcp_max_from_high,
+        min_above_low_pct=f_vcp_min_above_low,
+        base_length=f_vcp_base_length,
+        vol_contraction_ratio=f_vcp_vol_contraction,
+        breakout_vol_mult=f_vcp_breakout_vol,
+        pivot_proximity_pct=f_vcp_pivot_proximity,
+    )
+
+
 # ── Helper: candlestick chart ────────────────────────────────────────────────
 def make_chart(symbol: str, df: pd.DataFrame) -> go.Figure:
     """Build candlestick + EMA + volume chart for a stock."""
@@ -241,7 +377,12 @@ def make_chart(symbol: str, df: pd.DataFrame) -> go.Figure:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(l=50, r=20, t=40, b=20),
         template="plotly_dark",
+        paper_bgcolor="rgba(13,17,23,0.8)",
+        plot_bgcolor="rgba(22,27,34,0.9)",
+        font=dict(color="#c9d1d9"),
     )
+    fig.update_xaxes(gridcolor="rgba(48,54,61,0.5)", zerolinecolor="#30363d")
+    fig.update_yaxes(gridcolor="rgba(48,54,61,0.5)", zerolinecolor="#30363d")
     fig.update_xaxes(type="category", nticks=20, row=3, col=1)
     return fig
 
@@ -269,21 +410,56 @@ def get_nifty_regime():
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
-st.title("Indian Equity Screener")
-universe_label = "Nifty 500" if is_swing else "Nifty 250"
-strategy_label = "EMA Crossover + ADX" if is_swing else "EMA 200 Breakout"
-st.caption(f"Scan date: {datetime.now().strftime('%Y-%m-%d %H:%M')}  |  "
-           f"{universe_label} universe  |  {strategy_label} strategy")
+if is_swing:
+    universe_label, strategy_label = "Nifty 500", "EMA Crossover + ADX"
+elif is_vcp:
+    universe_label, strategy_label = "Nifty 500", "VCP (Volatility Contraction)"
+else:
+    universe_label, strategy_label = "Nifty 250", "EMA 200 Breakout"
+
+# Header
+st.markdown(f"""
+<div style="padding: 0.5rem 0 0.8rem 0;">
+    <h1 style="margin:0; color:#e6f1ff; font-size:2rem; font-weight:800; letter-spacing:-0.02em;">
+        Indian Equity Screener
+    </h1>
+    <p style="margin:0.3rem 0 0 0; color:#8892b0; font-size:0.9rem;">
+        {datetime.now().strftime('%d %b %Y, %H:%M')} &nbsp;&bull;&nbsp;
+        {universe_label} Universe &nbsp;&bull;&nbsp;
+        {strategy_label}
+    </p>
+</div>
+""", unsafe_allow_html=True)
 
 # Regime banner
 regime = get_nifty_regime()
 if regime:
-    color = "green" if regime["bullish"] else "red"
-    label = "BULLISH" if regime["bullish"] else "BEARISH"
-    st.markdown(
-        f"**Nifty 50 Regime:** :{'green' if regime['bullish'] else 'red'}[{label}] "
-        f"&mdash; {regime['price']} ({regime['pct']:+.2f}% vs 200 EMA at {regime['ema200']})"
-    )
+    if regime["bullish"]:
+        regime_color = "#26a69a"
+        regime_bg = "rgba(38,166,154,0.08)"
+        regime_border = "rgba(38,166,154,0.3)"
+        regime_label = "BULLISH"
+        regime_icon = "trending_up"
+    else:
+        regime_color = "#ef5350"
+        regime_bg = "rgba(239,83,80,0.08)"
+        regime_border = "rgba(239,83,80,0.3)"
+        regime_label = "BEARISH"
+        regime_icon = "trending_down"
+    st.markdown(f"""
+    <div style="background:{regime_bg}; border:1px solid {regime_border}; border-radius:8px;
+                padding:12px 18px; margin-bottom:0.5rem; display:flex; align-items:center; gap:12px;">
+        <span style="background:{regime_color}; color:#fff; font-weight:700; font-size:0.75rem;
+                     padding:4px 10px; border-radius:4px; letter-spacing:0.08em;">
+            {regime_label}
+        </span>
+        <span style="color:#c9d1d9; font-size:0.9rem;">
+            <strong>Nifty 50</strong> &nbsp;{regime['price']}
+            &nbsp;<span style="color:{regime_color};">({regime['pct']:+.2f}%)</span>
+            &nbsp;vs 200 EMA at {regime['ema200']}
+        </span>
+    </div>
+    """, unsafe_allow_html=True)
     if not regime["bullish"]:
         st.warning("Nifty 50 is below its 200 EMA. Swing longs carry higher risk. "
                    "Consider smaller position sizes.")
@@ -294,7 +470,10 @@ st.divider()
 if st.button("Run Screener", type="primary", use_container_width=True):
     # ── Step 1: Tickers ──────────────────────────────────────────────────
     with st.spinner(f"Fetching {universe_label} ticker list..."):
-        symbols = fetch_nifty500_tickers() if is_swing else fetch_nifty250_tickers()
+        if is_swing or is_vcp:
+            symbols = fetch_nifty500_tickers()
+        else:
+            symbols = fetch_nifty250_tickers()
     if not symbols:
         st.error(f"Could not fetch {universe_label} list. Check your connection.")
         st.stop()
@@ -307,7 +486,12 @@ if st.button("Run Screener", type="primary", use_container_width=True):
     # ── Step 3: Technical screening ──────────────────────────────────────
     tech_passed = {}
     for sym, df in price_data.items():
-        result = screen_with_params(df) if is_swing else screen_breakout_with_params(df)
+        if is_swing:
+            result = screen_with_params(df)
+        elif is_vcp:
+            result = screen_vcp_with_params(df)
+        else:
+            result = screen_breakout_with_params(df)
         if result is not None:
             avg_tv_cr = result["avg_traded_value"] / CRORE
             if avg_tv_cr >= f_adtv:
@@ -368,9 +552,11 @@ if "stats" in st.session_state:
     s = st.session_state["stats"]
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Universe", s["universe"])
-    c2.metric("Price Data", s["price_ok"])
-    c3.metric("Technical Pass", s["tech_pass"])
-    c4.metric("Final Matches", s["final"])
+    c2.metric("Price Data", s["price_ok"], f"{s['price_ok']}/{s['universe']}")
+    c3.metric("Technical Pass", s["tech_pass"],
+              f"{round(100 * s['tech_pass'] / max(s['price_ok'], 1), 1)}% pass rate")
+    c4.metric("Final Matches", s["final"],
+              f"{round(100 * s['final'] / max(s['tech_pass'], 1), 1)}% of tech pass" if s["tech_pass"] else "0")
     st.divider()
 
 if "results" in st.session_state:
@@ -379,10 +565,11 @@ if "results" in st.session_state:
     price_data = st.session_state["price_data"]
     last_strategy = st.session_state.get("strategy", STRATEGY_SWING)
     last_is_swing = (last_strategy == STRATEGY_SWING)
+    last_is_vcp = (last_strategy == STRATEGY_VCP)
 
     # ── Main results table ───────────────────────────────────────────────
     if results:
-        st.subheader("Stocks Passing All Filters")
+        st.subheader(f"Final Matches ({len(results)})")
         res_df = pd.DataFrame(results)
 
         # Columns vary by strategy
@@ -392,6 +579,17 @@ if "results" in st.session_state:
                 "rsi", "adx", "crossover_date", "days_since_crossover",
                 "crossover_vol_ratio", "stop_loss", "sl_pct",
                 "pct_from_52w_high", "avg_traded_value_cr",
+                "market_cap_cr", "sales_growth_pct", "profit_growth_pct",
+                "roe_pct", "debt_to_equity", "operating_cashflow_cr",
+                "promoter_holding_pct",
+            ]
+        elif last_is_vcp:
+            display_cols = [
+                "symbol", "price", "vcp_status", "pivot_high", "pct_below_pivot",
+                "pct_from_52w_high", "rsi",
+                "contraction_ratio", "vol_contraction", "breakout_vol_ratio",
+                "base_depth_pct", "stop_loss", "sl_pct",
+                "avg_traded_value_cr",
                 "market_cap_cr", "sales_growth_pct", "profit_growth_pct",
                 "roe_pct", "debt_to_equity", "operating_cashflow_cr",
                 "promoter_holding_pct",
@@ -418,11 +616,18 @@ if "results" in st.session_state:
             "sales_growth_pct": "SalesG%", "profit_growth_pct": "ProfitG%",
             "roe_pct": "ROE%", "debt_to_equity": "D/E",
             "operating_cashflow_cr": "OCF(Cr)", "promoter_holding_pct": "Promo%",
+            # VCP-specific
+            "vcp_status": "Status", "pivot_high": "Pivot", "pct_below_pivot": "%<Pivot",
+            "contraction_ratio": "Contraction", "vol_contraction": "VolDryUp",
+            "breakout_vol_ratio": "BrkoutVol", "base_depth_pct": "BaseDepth%",
         }
         show_df = res_df[display_cols].rename(columns=col_rename)
 
-        # Sort by days since crossover (freshest breakouts first)
-        if "Days" in show_df.columns:
+        # Sort
+        if last_is_vcp:
+            if "%<Pivot" in show_df.columns:
+                show_df = show_df.sort_values("%<Pivot", ascending=True)
+        elif "Days" in show_df.columns:
             show_df = show_df.sort_values("Days", ascending=True)
         elif "%>EMA200" in show_df.columns:
             show_df = show_df.sort_values("%>EMA200", ascending=True)
@@ -439,47 +644,90 @@ if "results" in st.session_state:
         for row in results:
             sym = row["symbol"]
             if sym in price_data:
-                days = row.get('days_since_crossover', '?')
                 if last_is_swing:
+                    days = row.get('days_since_crossover', '?')
                     label = (f"{sym} - Rs.{row['price']} | RSI {row['rsi']} | "
                              f"ADX {row.get('adx', 'N/A')} | Crossover {days}d ago | "
                              f"SL Rs.{row['stop_loss']}")
+                elif last_is_vcp:
+                    label = (f"{sym} - Rs.{row['price']} | {row['vcp_status']} | "
+                             f"Pivot Rs.{row['pivot_high']} ({row['pct_below_pivot']}% below) | "
+                             f"SL Rs.{row['stop_loss']}")
                 else:
-                    label = (f"{sym} - Rs.{row['price']} | {row['pct_above_ema200']}% > EMA200 | "
+                    days = row.get('days_since_crossover', '?')
+                    label = (f"{sym} - Rs.{row['price']} | {row.get('pct_above_ema200', '?')}% > EMA200 | "
                              f"Crossover {days}d ago | VolRatio {row.get('crossover_vol_ratio', 'N/A')} | "
                              f"SL Rs.{row['stop_loss']}")
                 with st.expander(label, expanded=True):
                     fig = make_chart(sym, price_data[sym].tail(120))
                     st.plotly_chart(fig, use_container_width=True)
 
-                    # Trade setup box
-                    tc1, tc2, tc3, tc4, tc5 = st.columns(5)
-                    tc1.metric("Entry", f"Rs.{row['price']}")
-                    tc2.metric("Stop Loss", f"Rs.{row['stop_loss']}", f"-{row['sl_pct']}%")
-                    tc3.metric("ATR(14)", f"Rs.{row['atr']}")
-                    tc4.metric("Crossover", f"{row.get('days_since_crossover', '?')}d ago",
-                               f"Vol {row.get('crossover_vol_ratio', 'N/A')}x")
-                    tc5.metric("% from 52W High", f"{row['pct_from_52w_high']}%")
+                    # Trade setup box - varies by strategy
+                    if last_is_vcp:
+                        tc1, tc2, tc3, tc4, tc5 = st.columns(5)
+                        tc1.metric("Entry", f"Rs.{row['price']}")
+                        tc2.metric("Stop Loss", f"Rs.{row['stop_loss']}", f"-{row['sl_pct']}%")
+                        tc3.metric("Pivot", f"Rs.{row['pivot_high']}",
+                                   f"{row['pct_below_pivot']}% below")
+                        tc4.metric("Vol Dry-Up", f"{row['vol_contraction']}x",
+                                   f"Brkout {row['breakout_vol_ratio']}x")
+                        tc5.metric("% from 52W High", f"{row['pct_from_52w_high']}%")
+                    else:
+                        tc1, tc2, tc3, tc4, tc5 = st.columns(5)
+                        tc1.metric("Entry", f"Rs.{row['price']}")
+                        tc2.metric("Stop Loss", f"Rs.{row['stop_loss']}", f"-{row['sl_pct']}%")
+                        tc3.metric("ATR(14)", f"Rs.{row['atr']}")
+                        tc4.metric("Crossover", f"{row.get('days_since_crossover', '?')}d ago",
+                                   f"Vol {row.get('crossover_vol_ratio', 'N/A')}x")
+                        tc5.metric("% from 52W High", f"{row['pct_from_52w_high']}%")
 
     else:
-        st.info("No stocks matched all criteria. Try relaxing filters in the sidebar.")
+        st.markdown("""
+        <div style="text-align:center; padding:2rem; background:rgba(239,83,80,0.06);
+                    border:1px solid rgba(239,83,80,0.2); border-radius:8px; margin:1rem 0;">
+            <p style="font-size:1.1rem; color:#ef5350; font-weight:600; margin:0;">
+                No stocks matched all criteria
+            </p>
+            <p style="color:#8892b0; margin:0.4rem 0 0 0; font-size:0.9rem;">
+                Try relaxing the fundamental or technical filters in the sidebar.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
 
     # ── Near-miss table ──────────────────────────────────────────────────
     if near_miss:
         st.divider()
-        st.subheader("Near Miss (Technical pass, Fundamental fail)")
-        st.caption("Strong charts but failed a fundamental filter")
+        st.subheader(f"Near Miss ({len(near_miss)})")
+        st.caption("Passed technical screening but failed one or more fundamental filters")
         nm_df = pd.DataFrame(near_miss)
-        nm_cols = ["symbol", "price", "rsi", "adx", "crossover_date",
-                   "days_since_crossover", "crossover_vol_ratio",
-                   "stop_loss", "sl_pct", "fail_reason"]
+
+        if last_is_vcp:
+            nm_cols = ["symbol", "price", "vcp_status", "pivot_high", "pct_below_pivot",
+                       "pct_from_52w_high", "rsi", "contraction_ratio",
+                       "vol_contraction", "stop_loss", "sl_pct", "fail_reason"]
+        else:
+            nm_cols = ["symbol", "price", "pct_above_ema200", "rsi", "crossover_date",
+                       "days_since_crossover", "crossover_vol_ratio",
+                       "stop_loss", "sl_pct", "fail_reason"]
+            if last_is_swing:
+                nm_cols.insert(4, "adx")
+
         nm_cols = [c for c in nm_cols if c in nm_df.columns]
-        nm_show = nm_df[nm_cols].rename(columns={
-            "symbol": "Symbol", "price": "CMP", "rsi": "RSI", "adx": "ADX",
+        nm_rename = {
+            "symbol": "Symbol", "price": "CMP", "pct_above_ema200": "%>EMA200",
+            "rsi": "RSI", "adx": "ADX",
             "crossover_date": "Crossover", "days_since_crossover": "Days",
             "crossover_vol_ratio": "VolRatio",
             "stop_loss": "SL", "sl_pct": "SL%", "fail_reason": "Failed Because",
-        })
+            "vcp_status": "Status", "pivot_high": "Pivot", "pct_below_pivot": "%<Pivot",
+            "pct_from_52w_high": "%<52wH", "contraction_ratio": "Contraction",
+            "vol_contraction": "VolDryUp",
+        }
+        nm_show = nm_df[nm_cols].rename(columns=nm_rename)
+        if last_is_vcp and "%<Pivot" in nm_show.columns:
+            nm_show = nm_show.sort_values("%<Pivot", ascending=True)
+        elif "Days" in nm_show.columns:
+            nm_show = nm_show.sort_values("Days", ascending=True)
         st.dataframe(nm_show, use_container_width=True, hide_index=True)
 
         # Charts for near-miss
@@ -492,4 +740,10 @@ if "results" in st.session_state:
                     st.plotly_chart(fig, use_container_width=True)
 
 elif "stats" not in st.session_state:
-    st.info("Configure filters in the sidebar, then click **Run Screener** to start.")
+    st.markdown("""
+    <div style="text-align:center; padding:4rem 2rem; color:#8892b0;">
+        <p style="font-size:3rem; margin:0;">&#x1F50D;</p>
+        <h3 style="color:#ccd6f6; margin:0.5rem 0;">Ready to Scan</h3>
+        <p>Configure filters in the sidebar, then click <strong>Run Screener</strong> to start.</p>
+    </div>
+    """, unsafe_allow_html=True)

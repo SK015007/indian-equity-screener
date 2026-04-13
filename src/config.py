@@ -16,6 +16,15 @@ ATR_PERIOD = 14         # ATR period for stop-loss calculation
 ATR_SL_MULTIPLIER = 2.0 # Stop loss = entry - (ATR * multiplier)
 NIFTY_REGIME_CHECK = True  # Check if Nifty 50 is above its 200 DMA
 
+# === VCP (Volatility Contraction Pattern) ===
+VCP_MAX_FROM_52W_HIGH_PCT = 25.0  # Price must be within 25% of 52W high
+VCP_MIN_ABOVE_52W_LOW_PCT = 25.0  # Price must be at least 25% above 52W low
+VCP_BASE_LENGTH = 90              # Days to look back for the consolidation base
+VCP_MIN_CONTRACTIONS = 2          # Minimum number of tightening contractions
+VCP_VOL_CONTRACTION_RATIO = 0.8   # Recent vol / prior vol must be below this
+VCP_BREAKOUT_VOL_MULT = 1.5       # Min volume ratio on breakout vs 50-day avg
+VCP_PIVOT_PROXIMITY_PCT = 3.0     # Max % below pivot high to qualify
+
 # === Fundamental Conditions ===
 MIN_MARKET_CAP_CR = 1000       # Minimum market cap in crores (₹)
 MIN_SALES_GROWTH_PCT = 10.0    # Minimum YoY sales growth %

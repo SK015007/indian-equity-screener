@@ -7,6 +7,9 @@ from src.config import (
     EMA_LONG, EMA_SHORT, CROSSOVER_LOOKBACK, VOLUME_MULTIPLIER,
     VOLUME_AVG_PERIOD, RSI_PERIOD, RSI_LOWER, RSI_UPPER, MAX_ABOVE_EMA_PCT,
     ADX_PERIOD, ADX_MIN, ATR_PERIOD, ATR_SL_MULTIPLIER,
+    VCP_MAX_FROM_52W_HIGH_PCT, VCP_MIN_ABOVE_52W_LOW_PCT, VCP_BASE_LENGTH,
+    VCP_MIN_CONTRACTIONS, VCP_VOL_CONTRACTION_RATIO, VCP_BREAKOUT_VOL_MULT,
+    VCP_PIVOT_PROXIMITY_PCT,
 )
 
 
@@ -148,6 +151,178 @@ def screen_ema200_breakout(df: pd.DataFrame, max_above_ema_pct: float = MAX_ABOV
         "stop_loss": stop_loss,
         "sl_pct": sl_pct,
         "pct_from_52w_high": pct_from_52w_high,
+    }
+
+
+# ── VCP (Volatility Contraction Pattern) ────────────────────────────────────
+
+def _find_pivot_highs(high: pd.Series, order: int = 5) -> list[tuple[int, float]]:
+    """Find local pivot highs. Returns list of (index_position, price)."""
+    pivots = []
+    for i in range(order, len(high) - order):
+        if all(high.iloc[i] >= high.iloc[i - j] for j in range(1, order + 1)) and \
+           all(high.iloc[i] >= high.iloc[i + j] for j in range(1, order + 1)):
+            pivots.append((i, float(high.iloc[i])))
+    return pivots
+
+
+def screen_vcp(df: pd.DataFrame,
+               max_from_high_pct: float = VCP_MAX_FROM_52W_HIGH_PCT,
+               min_above_low_pct: float = VCP_MIN_ABOVE_52W_LOW_PCT,
+               base_length: int = VCP_BASE_LENGTH,
+               min_contractions: int = VCP_MIN_CONTRACTIONS,
+               vol_contraction_ratio: float = VCP_VOL_CONTRACTION_RATIO,
+               breakout_vol_mult: float = VCP_BREAKOUT_VOL_MULT,
+               pivot_proximity_pct: float = VCP_PIVOT_PROXIMITY_PCT) -> dict | None:
+    """VCP (Volatility Contraction Pattern) screener - Mark Minervini style.
+
+    Detects stocks consolidating near highs with tightening price contractions
+    and declining volume, ready for or just beginning a breakout.
+
+    Returns dict with key metrics if stock qualifies, else None.
+    """
+    if df is None or len(df) < EMA_LONG + base_length:
+        return None
+
+    close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
+    volume = df["Volume"]
+
+    ema200 = calc_ema(close, EMA_LONG)
+    ema150 = calc_ema(close, 150)
+    ema50 = calc_ema(close, EMA_SHORT)
+    rsi = calc_rsi(close, RSI_PERIOD)
+    atr = calc_atr(high, low, close, ATR_PERIOD)
+
+    cp = float(close.iloc[-1])
+    ce200 = float(ema200.iloc[-1])
+    ce150 = float(ema150.iloc[-1])
+    ce50 = float(ema50.iloc[-1])
+    cr = float(rsi.iloc[-1])
+    ca = float(atr.iloc[-1])
+
+    # ── Minervini Trend Template ────────────────────────────────────────
+    # Price must be above 150 EMA and 200 EMA
+    if cp <= ce200 or cp <= ce150:
+        return None
+
+    # 150 EMA must be above 200 EMA (stacked EMAs)
+    if ce150 <= ce200:
+        return None
+
+    # 200 EMA must be rising (current > 1 month ago)
+    if len(ema200) < 22 or float(ema200.iloc[-1]) <= float(ema200.iloc[-22]):
+        return None
+
+    # Price within max_from_high_pct of 52W high
+    high_52w = float(high.max())
+    pct_from_52w_high = round(((high_52w - cp) / high_52w) * 100, 2)
+    if pct_from_52w_high > max_from_high_pct:
+        return None
+
+    # Price at least min_above_low_pct above 52W low
+    low_52w = float(low.min())
+    pct_above_52w_low = ((cp - low_52w) / low_52w) * 100
+    if pct_above_52w_low < min_above_low_pct:
+        return None
+
+    # ── Volatility Contraction Detection ────────────────────────────────
+    base = df.tail(base_length)
+    base_high = base["High"]
+
+    # Split base into segments and check tightening ranges
+    seg_len = base_length // (min_contractions + 1)
+    if seg_len < 10:
+        seg_len = 10
+
+    ranges = []
+    for i in range(min_contractions + 1):
+        start = i * seg_len
+        end = min(start + seg_len, len(base))
+        if end <= start:
+            break
+        seg = base.iloc[start:end]
+        seg_range = (float(seg["High"].max()) - float(seg["Low"].min()))
+        seg_pct = (seg_range / float(seg["Low"].min())) * 100
+        ranges.append(seg_pct)
+
+    if len(ranges) < min_contractions + 1:
+        return None
+
+    # Check that later segments are tighter
+    contracting_count = sum(1 for i in range(len(ranges) - 1) if ranges[i] > ranges[i + 1])
+    if contracting_count < min_contractions:
+        return None
+
+    contraction_ratio = round(ranges[-1] / ranges[0], 2) if ranges[0] > 0 else 1.0
+
+    # ATR contraction confirmation
+    atr_recent = float(atr.iloc[-10:].mean())
+    atr_prior = float(atr.iloc[-base_length:-base_length // 2].mean())
+    atr_contraction = round(atr_recent / atr_prior, 2) if atr_prior > 0 else 1.0
+
+    # ── Volume Dry-up ───────────────────────────────────────────────────
+    vol_recent_20 = float(volume.iloc[-20:].mean())
+    vol_prior_50 = float(volume.iloc[-50:-20].mean()) if len(volume) >= 50 else float(volume.mean())
+    vol_ratio = round(vol_recent_20 / vol_prior_50, 2) if vol_prior_50 > 0 else 1.0
+
+    if vol_ratio > vol_contraction_ratio:
+        return None
+
+    # ── Pivot / Breakout Zone ───────────────────────────────────────────
+    pivot_high = float(base_high.max())
+    pct_below_pivot = ((pivot_high - cp) / pivot_high) * 100
+
+    breakout_active = cp >= pivot_high
+    near_pivot = pct_below_pivot <= pivot_proximity_pct
+
+    if not breakout_active and not near_pivot:
+        return None
+
+    # Breakout volume (last 3 days max vol vs 50-day avg)
+    avg_vol_50 = float(volume.iloc[-50:].mean()) if len(volume) >= 50 else float(volume.mean())
+    recent_max_vol = float(volume.iloc[-3:].max())
+    breakout_vol_ratio = round(recent_max_vol / avg_vol_50, 2) if avg_vol_50 > 0 else 0
+
+    # Determine status
+    if breakout_active and breakout_vol_ratio >= breakout_vol_mult:
+        vcp_status = "BREAKING OUT"
+    elif breakout_active:
+        vcp_status = "ABOVE PIVOT"
+    else:
+        vcp_status = "NEAR PIVOT"
+
+    # ── Standard metrics ────────────────────────────────────────────────
+    recent_20_df = df.tail(VOLUME_AVG_PERIOD)
+    avg_traded_value = float((recent_20_df["Close"] * recent_20_df["Volume"]).mean())
+
+    # Stop loss: below the last contraction low or ATR-based
+    last_seg_low = float(base.iloc[-seg_len:]["Low"].min())
+    atr_sl = round(cp - ATR_SL_MULTIPLIER * ca, 2)
+    stop_loss = max(atr_sl, round(last_seg_low, 2))
+    sl_pct = round(((cp - stop_loss) / cp) * 100, 2)
+
+    return {
+        "price": round(cp, 2),
+        "ema200": round(ce200, 2),
+        "ema150": round(ce150, 2),
+        "ema50": round(ce50, 2),
+        "rsi": round(cr, 2),
+        "atr": round(ca, 2),
+        "pct_from_52w_high": pct_from_52w_high,
+        "pct_above_52w_low": round(pct_above_52w_low, 2),
+        "pivot_high": round(pivot_high, 2),
+        "pct_below_pivot": round(pct_below_pivot, 2),
+        "vcp_status": vcp_status,
+        "contraction_ratio": contraction_ratio,
+        "atr_contraction": atr_contraction,
+        "vol_contraction": vol_ratio,
+        "breakout_vol_ratio": breakout_vol_ratio,
+        "base_depth_pct": round(ranges[0], 2),
+        "avg_traded_value": avg_traded_value,
+        "stop_loss": stop_loss,
+        "sl_pct": sl_pct,
     }
 
 
