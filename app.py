@@ -29,6 +29,11 @@ from src.config import (
 from src.stock_universe import fetch_nifty500_tickers, fetch_nifty250_tickers
 from src.data_fetcher import fetch_bulk_price_data, fetch_fundamentals
 from src.technicals import screen_technical, screen_ema200_breakout, screen_vcp, calc_ema, calc_rsi, calc_atr, calc_adx
+from src.signal_tracker import (
+    record_signal, check_and_update_signals,
+    get_active_signals, get_closed_signals,
+    get_performance_stats, manually_close_signal,
+)
 
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -547,6 +552,21 @@ if st.button("Run Screener", type="primary", use_container_width=True):
         "final": len(final_results),
     }
 
+    # ── Auto-save new signals to tracker ─────────────────────────────────
+    new_signals = 0
+    for row in final_results:
+        saved = record_signal(
+            symbol=row["symbol"],
+            strategy=strategy,
+            entry_price=row["price"],
+            stop_loss=row["stop_loss"],
+            sl_pct=row["sl_pct"],
+        )
+        if saved:
+            new_signals += 1
+    if new_signals:
+        st.toast(f"{new_signals} new signal(s) saved to tracker")
+
 # ── Display Results ──────────────────────────────────────────────────────────
 if "stats" in st.session_state:
     s = st.session_state["stats"]
@@ -747,3 +767,86 @@ elif "stats" not in st.session_state:
         <p>Configure filters in the sidebar, then click <strong>Run Screener</strong> to start.</p>
     </div>
     """, unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SIGNAL JOURNAL — persistent tracking of all signals until TP/SL hit
+# ═══════════════════════════════════════════════════════════════════════════════
+st.divider()
+st.markdown("""
+<h2 style="margin-top:0.5rem;">Signal Journal</h2>
+""", unsafe_allow_html=True)
+st.caption("Signals are auto-saved when the screener runs. They are tracked until target or stop-loss is hit.")
+
+# Check signals button
+jcol1, jcol2 = st.columns([1, 3])
+with jcol1:
+    if st.button("Update Signals", use_container_width=True,
+                 help="Check current prices for all active signals and update TP/SL status"):
+        with st.spinner("Checking active signals against current prices..."):
+            result = check_and_update_signals()
+        if result["tp1_hits"]:
+            st.success(f"TP1 Hit: {', '.join(result['tp1_hits'])}")
+        if result["tp2_hits"]:
+            st.success(f"TP2 Hit: {', '.join(result['tp2_hits'])}")
+        if result["sl_hits"]:
+            st.error(f"SL Hit: {', '.join(result['sl_hits'])}")
+        if not result["tp1_hits"] and not result["tp2_hits"] and not result["sl_hits"]:
+            st.info(f"Checked {result['updated']} signal(s). No TP/SL triggers.")
+
+# Performance stats
+stats = get_performance_stats()
+if stats["total_closed"] > 0 or stats["total_active"] > 0:
+    st.markdown("#### Performance")
+    pc1, pc2, pc3, pc4, pc5 = st.columns(5)
+    pc1.metric("Active", stats["total_active"])
+    pc2.metric("Closed", stats["total_closed"])
+    pc3.metric("Win Rate", f"{stats['win_rate']}%",
+               f"{stats['wins']}W / {stats['losses']}L")
+    pc4.metric("Avg Win", f"{stats['avg_win_pct']:+.1f}%")
+    pc5.metric("Avg Loss", f"{stats['avg_loss_pct']:+.1f}%")
+
+# Active signals table
+active_df = get_active_signals()
+if not active_df.empty:
+    st.markdown("#### Active Signals")
+    active_display = active_df[[
+        "symbol", "strategy", "entry_price", "stop_loss", "sl_pct",
+        "target_1", "target_2", "signal_date", "pnl_pct",
+        "high_since_entry", "low_since_entry", "last_checked",
+    ]].copy()
+    active_display.columns = [
+        "Symbol", "Strategy", "Entry", "SL", "SL%",
+        "Target 1", "Target 2", "Signal Date", "Unrealized P&L%",
+        "High Since", "Low Since", "Last Checked",
+    ]
+    # Color-code P&L
+    st.dataframe(active_display, use_container_width=True, hide_index=True)
+
+    # Manual close option
+    with st.expander("Manually close a signal"):
+        signal_options = {f"{r['symbol']} (Entry: Rs.{r['entry_price']} on {r['signal_date']})": r['id']
+                          for _, r in active_df.iterrows()}
+        if signal_options:
+            selected = st.selectbox("Select signal to close", list(signal_options.keys()))
+            close_reason = st.text_input("Reason", "Manual close")
+            if st.button("Close Signal"):
+                manually_close_signal(signal_options[selected], close_reason)
+                st.success(f"Closed signal for {selected}")
+                st.rerun()
+else:
+    st.info("No active signals. Run the screener to generate new signals.")
+
+# Closed signals table
+closed_df = get_closed_signals()
+if not closed_df.empty:
+    st.markdown("#### Closed Signals (History)")
+    closed_display = closed_df[[
+        "symbol", "strategy", "entry_price", "exit_price", "pnl_pct",
+        "status", "exit_reason", "signal_date", "exit_date",
+    ]].copy()
+    closed_display.columns = [
+        "Symbol", "Strategy", "Entry", "Exit", "P&L%",
+        "Result", "Reason", "Signal Date", "Exit Date",
+    ]
+    st.dataframe(closed_display, use_container_width=True, hide_index=True)
