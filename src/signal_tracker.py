@@ -307,11 +307,89 @@ def fetch_live_prices(symbols: list[str]) -> dict[str, float]:
             for sym, df in ohlc.items() if not df.empty}
 
 
+def _fetch_intraday(symbol: str) -> pd.DataFrame | None:
+    """Fetch today's intraday data (5-min bars) for a single NSE symbol."""
+    try:
+        ticker = yf.Ticker(f"{symbol}.NS")
+        df = ticker.history(period="1d", interval="5m")
+        if df is None or df.empty:
+            return None
+        df = df.dropna(subset=["Close"])
+        return df if len(df) > 0 else None
+    except Exception:
+        return None
+
+
+def _compute_high_low_close(ohlc: pd.DataFrame, signal_dt: date,
+                             entry_price: float, symbol: str,
+                             today: date) -> tuple[float, float, float]:
+    """Compute (cmp, high_since, low_since) for a single signal.
+
+    - cmp: most recent close
+    - high_since: max High from signal_date to today (incl. entry)
+    - low_since: min Low from signal_date to today (incl. entry)
+    """
+    cmp_val = entry_price
+    high_val = entry_price
+    low_val = entry_price
+
+    if ohlc is None or ohlc.empty:
+        return cmp_val, high_val, low_val
+
+    # Filter to bars on or after signal date
+    try:
+        # Make timezone-naive comparison
+        idx_dates = pd.to_datetime(ohlc.index).date
+        mask = idx_dates >= signal_dt
+        since_signal = ohlc[mask]
+    except Exception:
+        since_signal = ohlc.tail((today - signal_dt).days + 1)
+
+    # If empty (today's bar not in daily data yet), try intraday
+    if since_signal.empty or len(since_signal) == 0:
+        intraday = _fetch_intraday(symbol)
+        if intraday is not None and not intraday.empty:
+            since_signal = intraday
+        else:
+            # Last resort - use the most recent daily bar available
+            since_signal = ohlc.tail(1)
+
+    # CMP from latest close
+    try:
+        close_series = since_signal["Close"].dropna()
+        if len(close_series) > 0:
+            cmp_val = round(float(close_series.iloc[-1]), 2)
+    except Exception:
+        pass
+
+    # High since - use nanmax to ignore NaN, then bound below by entry
+    try:
+        high_series = since_signal["High"].dropna()
+        if len(high_series) > 0:
+            actual_high = float(high_series.max())
+            # Include entry price in the range (in case price gapped down at entry)
+            high_val = round(max(actual_high, entry_price, cmp_val), 2)
+    except Exception:
+        pass
+
+    # Low since - use nanmin
+    try:
+        low_series = since_signal["Low"].dropna()
+        if len(low_series) > 0:
+            actual_low = float(low_series.min())
+            low_val = round(min(actual_low, entry_price, cmp_val), 2)
+    except Exception:
+        pass
+
+    return cmp_val, high_val, low_val
+
+
 def get_active_signals_with_live_prices() -> pd.DataFrame:
     """Get active signals with live CMP, live unrealized P&L, and live MFE/MAE.
 
     Computes High Since and Low Since on-the-fly from actual OHLC data
-    between signal_date and today (no longer relies on stale DB values).
+    between signal_date and today. For today's signals, falls back to
+    intraday 5-min bars when daily data isn't available yet.
     """
     df = get_active_signals()
     if df.empty:
@@ -320,12 +398,11 @@ def get_active_signals_with_live_prices() -> pd.DataFrame:
     today = date.today()
     symbols = df["symbol"].unique().tolist()
 
-    # Determine how many days of history we need (max age of any signal + buffer)
     df["_signal_dt"] = pd.to_datetime(df["signal_date"]).dt.date
     max_age_days = max((today - sd).days for sd in df["_signal_dt"]) + 5
     max_age_days = max(max_age_days, 5)
 
-    # Fetch OHLC for that range
+    # Fetch daily OHLC for the full range
     ohlc_data = fetch_ohlc_history(symbols, days=max_age_days)
 
     # Compute live CMP, High Since, Low Since for each row
@@ -335,29 +412,17 @@ def get_active_signals_with_live_prices() -> pd.DataFrame:
     for _, row in df.iterrows():
         sym = row["symbol"]
         signal_dt = row["_signal_dt"]
+        entry = float(row["entry_price"])
         ohlc = ohlc_data.get(sym)
-        if ohlc is None or ohlc.empty:
-            cmps[sym] = row["entry_price"]
-            highs[sym] = row["entry_price"]
-            lows[sym] = row["entry_price"]
-            continue
 
-        # Filter from signal date forward
-        try:
-            since_signal = ohlc[ohlc.index.date >= signal_dt]
-        except Exception:
-            since_signal = ohlc.tail((today - signal_dt).days + 1)
-
-        if since_signal.empty:
-            since_signal = ohlc.tail(1)
-
-        cmps[sym] = round(float(since_signal["Close"].iloc[-1]), 2)
-        # Track full range including entry price
-        highs[sym] = round(max(float(since_signal["High"].max()), row["entry_price"]), 2)
-        lows[sym] = round(min(float(since_signal["Low"].min()), row["entry_price"]), 2)
+        cmp_val, high_val, low_val = _compute_high_low_close(
+            ohlc, signal_dt, entry, sym, today
+        )
+        cmps[sym] = cmp_val
+        highs[sym] = high_val
+        lows[sym] = low_val
 
     df["cmp"] = df["symbol"].map(cmps).fillna(df["entry_price"])
-    # Override stale DB values with computed ones
     df["high_since_entry"] = df["symbol"].map(highs).fillna(df["entry_price"])
     df["low_since_entry"] = df["symbol"].map(lows).fillna(df["entry_price"])
 
