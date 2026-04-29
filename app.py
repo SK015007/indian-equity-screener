@@ -31,8 +31,8 @@ from src.data_fetcher import fetch_bulk_price_data, fetch_fundamentals
 from src.technicals import screen_technical, screen_ema200_breakout, screen_vcp, calc_ema, calc_rsi, calc_atr, calc_adx
 from src.signal_tracker import (
     record_signal, check_and_update_signals,
-    get_active_signals, get_closed_signals,
-    get_performance_stats, manually_close_signal,
+    get_active_signals, get_active_signals_with_live_prices,
+    get_closed_signals, get_performance_stats, manually_close_signal,
 )
 
 # ── Page Config ──────────────────────────────────────────────────────────────
@@ -556,6 +556,8 @@ if st.button("Run Screener", type="primary", use_container_width=True):
             new_signals += 1
     if new_signals:
         st.toast(f"{new_signals} new signal(s) saved to tracker")
+        # Mark that the cache needs refresh
+        st.session_state["_signals_cache_bust"] = st.session_state.get("_signals_cache_bust", 0) + 1
 
 # ── Display Results ──────────────────────────────────────────────────────────
 if "stats" in st.session_state:
@@ -796,22 +798,81 @@ if stats["total_closed"] > 0 or stats["total_active"] > 0:
     pc4.metric("Avg Win", f"{stats['avg_win_pct']:+.1f}%")
     pc5.metric("Avg Loss", f"{stats['avg_loss_pct']:+.1f}%")
 
-# Active signals table
-active_df = get_active_signals()
-if not active_df.empty:
+# Active signals table — fetches LIVE CMP for real-time unrealized P&L
+ac1, ac2 = st.columns([3, 1])
+with ac1:
     st.markdown("#### Active Signals")
+with ac2:
+    refresh_live = st.button("Refresh CMP", use_container_width=True,
+                             help="Fetch latest market price for all active signals")
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_active_with_live(_nonce: int = 0):
+    return get_active_signals_with_live_prices()
+
+if refresh_live:
+    _cached_active_with_live.clear()
+
+# Use the cache_bust counter to force refresh after new signals
+_nonce = st.session_state.get("_signals_cache_bust", 0)
+
+with st.spinner("Fetching live prices..."):
+    active_df = _cached_active_with_live(_nonce)
+
+if not active_df.empty:
+    # Compute days since signal date
+    today = datetime.now().date()
+    active_df["signal_dt"] = pd.to_datetime(active_df["signal_date"]).dt.date
+    active_df["age"] = active_df["signal_dt"].apply(
+        lambda d: "TODAY" if d == today else f"{(today - d).days}d ago"
+    )
+
+    # Display columns - prioritize live data
     active_display = active_df[[
-        "symbol", "strategy", "entry_price", "stop_loss", "sl_pct",
-        "target_1", "target_2", "signal_date", "pnl_pct",
-        "high_since_entry", "low_since_entry", "last_checked",
+        "age", "symbol", "strategy", "entry_price", "cmp", "live_pnl_pct",
+        "stop_loss", "dist_to_sl_pct", "target_1", "dist_to_tp1_pct", "target_2",
+        "high_since_entry", "low_since_entry", "signal_date",
     ]].copy()
     active_display.columns = [
-        "Symbol", "Strategy", "Entry", "SL", "SL%",
-        "Target 1", "Target 2", "Signal Date", "Unrealized P&L%",
-        "High Since", "Low Since", "Last Checked",
+        "Age", "Symbol", "Strategy", "Entry", "CMP", "Live P&L%",
+        "SL", "% to SL", "TP1", "% to TP1", "TP2",
+        "High Since", "Low Since", "Signal Date",
     ]
-    # Color-code P&L
-    st.dataframe(active_display, use_container_width=True, hide_index=True)
+
+    # Strategy short labels
+    active_display["Strategy"] = active_display["Strategy"].str.replace(
+        "Swing Trade (EMA Crossover + ADX)", "Swing", regex=False
+    ).str.replace(
+        "EMA 200 Breakout (Nifty 250)", "Breakout", regex=False
+    ).str.replace(
+        "VCP - Volatility Contraction", "VCP", regex=False
+    )
+
+    # Color-code Live P&L column
+    def _color_pnl(val):
+        try:
+            v = float(val)
+            if v > 0:
+                return "color: #26a69a; font-weight: 600;"
+            elif v < 0:
+                return "color: #ef5350; font-weight: 600;"
+        except (ValueError, TypeError):
+            pass
+        return ""
+
+    def _color_age(val):
+        if val == "TODAY":
+            return "background-color: rgba(38,166,154,0.15); color: #26a69a; font-weight: 700;"
+        return ""
+
+    styled = active_display.style \
+        .applymap(_color_pnl, subset=["Live P&L%"]) \
+        .applymap(_color_age, subset=["Age"])
+
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    st.caption(f"CMP cached for 60s. Showing {len(active_df)} active signal(s). "
+               f"Live P&L = (CMP - Entry) / Entry %. Click 'Refresh CMP' for fresh prices.")
 
     # Manual close option
     with st.expander("Manually close a signal"):
@@ -822,6 +883,7 @@ if not active_df.empty:
             close_reason = st.text_input("Reason", "Manual close")
             if st.button("Close Signal"):
                 manually_close_signal(signal_options[selected], close_reason)
+                _cached_active_with_live.clear()
                 st.success(f"Closed signal for {selected}")
                 st.rerun()
 else:

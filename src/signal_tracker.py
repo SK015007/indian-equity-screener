@@ -254,6 +254,70 @@ def get_performance_stats() -> dict:
     }
 
 
+def fetch_live_prices(symbols: list[str]) -> dict[str, float]:
+    """Fetch current market price for a list of NSE symbols.
+
+    Returns dict {symbol: cmp}. Skips any that fail.
+    """
+    if not symbols:
+        return {}
+
+    nse_symbols = [f"{s}.NS" for s in symbols]
+    prices = {}
+
+    try:
+        # Batch fetch using yf.download (last 1d, only need close)
+        data = yf.download(
+            " ".join(nse_symbols), period="2d", progress=False,
+            group_by="ticker", threads=True,
+        )
+
+        for sym, nse_sym in zip(symbols, nse_symbols):
+            try:
+                if len(symbols) == 1:
+                    df = data
+                else:
+                    if nse_sym not in data.columns.get_level_values(0):
+                        continue
+                    df = data[nse_sym]
+
+                if df is None or df.empty:
+                    continue
+                close = df["Close"].dropna()
+                if len(close) > 0:
+                    prices[sym] = round(float(close.iloc[-1]), 2)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return prices
+
+
+def get_active_signals_with_live_prices() -> pd.DataFrame:
+    """Get active signals with live CMP and live unrealized P&L."""
+    df = get_active_signals()
+    if df.empty:
+        return df
+
+    symbols = df["symbol"].unique().tolist()
+    live_prices = fetch_live_prices(symbols)
+
+    # Add CMP and live P&L columns
+    df["cmp"] = df["symbol"].map(live_prices).fillna(df["entry_price"])
+    df["live_pnl_pct"] = round(
+        ((df["cmp"] - df["entry_price"]) / df["entry_price"]) * 100, 2
+    )
+    # Distance to SL and TP from CMP
+    df["dist_to_sl_pct"] = round(
+        ((df["cmp"] - df["stop_loss"]) / df["cmp"]) * 100, 2
+    )
+    df["dist_to_tp1_pct"] = round(
+        ((df["target_1"] - df["cmp"]) / df["cmp"]) * 100, 2
+    )
+    return df
+
+
 def manually_close_signal(signal_id: int, reason: str = "Manual close"):
     """Manually close an active signal."""
     conn = _get_conn()
