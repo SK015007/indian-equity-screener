@@ -865,7 +865,8 @@ if not active_df.empty:
         display_cols = [
             "age", "symbol", "strategy_short", "entry_price", "cmp", "live_pnl_pct",
             "stop_loss", "dist_to_sl_pct", "target_1", "dist_to_tp1_pct", "target_2",
-            "high_since_entry", "low_since_entry", "signal_date",
+            "high_since_entry", "mfe_pct", "low_since_entry", "mae_pct",
+            "signal_date",
         ]
         # Only keep columns that exist
         display_cols = [c for c in display_cols if c in active_df.columns]
@@ -876,7 +877,8 @@ if not active_df.empty:
             "entry_price": "Entry", "cmp": "CMP", "live_pnl_pct": "Live P&L%",
             "stop_loss": "SL", "dist_to_sl_pct": "% to SL",
             "target_1": "TP1", "dist_to_tp1_pct": "% to TP1", "target_2": "TP2",
-            "high_since_entry": "High Since", "low_since_entry": "Low Since",
+            "high_since_entry": "High Since", "mfe_pct": "MFE%",
+            "low_since_entry": "Low Since", "mae_pct": "MAE%",
             "signal_date": "Signal Date",
         }
         active_display = active_display.rename(columns=rename_map)

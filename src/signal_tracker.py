@@ -254,21 +254,22 @@ def get_performance_stats() -> dict:
     }
 
 
-def fetch_live_prices(symbols: list[str]) -> dict[str, float]:
-    """Fetch current market price for a list of NSE symbols.
+def fetch_ohlc_history(symbols: list[str], days: int = 90) -> dict[str, pd.DataFrame]:
+    """Fetch OHLC history for a list of NSE symbols.
 
-    Returns dict {symbol: cmp}. Skips any that fail.
+    Returns dict {symbol: DataFrame} with OHLCV data. Skips any that fail.
     """
     if not symbols:
         return {}
 
+    # Cap days at a reasonable max
+    days = max(days, 5)
     nse_symbols = [f"{s}.NS" for s in symbols]
-    prices = {}
+    result = {}
 
     try:
-        # Batch fetch using yf.download (last 1d, only need close)
         data = yf.download(
-            " ".join(nse_symbols), period="2d", progress=False,
+            " ".join(nse_symbols), period=f"{days}d", progress=False,
             group_by="ticker", threads=True,
         )
 
@@ -283,30 +284,93 @@ def fetch_live_prices(symbols: list[str]) -> dict[str, float]:
 
                 if df is None or df.empty:
                     continue
-                close = df["Close"].dropna()
-                if len(close) > 0:
-                    prices[sym] = round(float(close.iloc[-1]), 2)
+                df = df.dropna(subset=["Close"])
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.droplevel(1)
+                if len(df) > 0:
+                    result[sym] = df
             except Exception:
                 continue
     except Exception:
         pass
 
-    return prices
+    return result
+
+
+def fetch_live_prices(symbols: list[str]) -> dict[str, float]:
+    """Fetch current market price for a list of NSE symbols.
+
+    Returns dict {symbol: cmp}. Skips any that fail.
+    """
+    ohlc = fetch_ohlc_history(symbols, days=2)
+    return {sym: round(float(df["Close"].iloc[-1]), 2)
+            for sym, df in ohlc.items() if not df.empty}
 
 
 def get_active_signals_with_live_prices() -> pd.DataFrame:
-    """Get active signals with live CMP and live unrealized P&L."""
+    """Get active signals with live CMP, live unrealized P&L, and live MFE/MAE.
+
+    Computes High Since and Low Since on-the-fly from actual OHLC data
+    between signal_date and today (no longer relies on stale DB values).
+    """
     df = get_active_signals()
     if df.empty:
         return df
 
+    today = date.today()
     symbols = df["symbol"].unique().tolist()
-    live_prices = fetch_live_prices(symbols)
 
-    # Add CMP and live P&L columns
-    df["cmp"] = df["symbol"].map(live_prices).fillna(df["entry_price"])
+    # Determine how many days of history we need (max age of any signal + buffer)
+    df["_signal_dt"] = pd.to_datetime(df["signal_date"]).dt.date
+    max_age_days = max((today - sd).days for sd in df["_signal_dt"]) + 5
+    max_age_days = max(max_age_days, 5)
+
+    # Fetch OHLC for that range
+    ohlc_data = fetch_ohlc_history(symbols, days=max_age_days)
+
+    # Compute live CMP, High Since, Low Since for each row
+    cmps = {}
+    highs = {}
+    lows = {}
+    for _, row in df.iterrows():
+        sym = row["symbol"]
+        signal_dt = row["_signal_dt"]
+        ohlc = ohlc_data.get(sym)
+        if ohlc is None or ohlc.empty:
+            cmps[sym] = row["entry_price"]
+            highs[sym] = row["entry_price"]
+            lows[sym] = row["entry_price"]
+            continue
+
+        # Filter from signal date forward
+        try:
+            since_signal = ohlc[ohlc.index.date >= signal_dt]
+        except Exception:
+            since_signal = ohlc.tail((today - signal_dt).days + 1)
+
+        if since_signal.empty:
+            since_signal = ohlc.tail(1)
+
+        cmps[sym] = round(float(since_signal["Close"].iloc[-1]), 2)
+        # Track full range including entry price
+        highs[sym] = round(max(float(since_signal["High"].max()), row["entry_price"]), 2)
+        lows[sym] = round(min(float(since_signal["Low"].min()), row["entry_price"]), 2)
+
+    df["cmp"] = df["symbol"].map(cmps).fillna(df["entry_price"])
+    # Override stale DB values with computed ones
+    df["high_since_entry"] = df["symbol"].map(highs).fillna(df["entry_price"])
+    df["low_since_entry"] = df["symbol"].map(lows).fillna(df["entry_price"])
+
+    # Live P&L
     df["live_pnl_pct"] = round(
         ((df["cmp"] - df["entry_price"]) / df["entry_price"]) * 100, 2
+    )
+    # MFE / MAE %
+    df["mfe_pct"] = round(
+        ((df["high_since_entry"] - df["entry_price"]) / df["entry_price"]) * 100, 2
+    )
+    df["mae_pct"] = round(
+        ((df["low_since_entry"] - df["entry_price"]) / df["entry_price"]) * 100, 2
     )
     # Distance to SL and TP from CMP
     df["dist_to_sl_pct"] = round(
@@ -315,6 +379,8 @@ def get_active_signals_with_live_prices() -> pd.DataFrame:
     df["dist_to_tp1_pct"] = round(
         ((df["target_1"] - df["cmp"]) / df["cmp"]) * 100, 2
     )
+
+    df = df.drop(columns=["_signal_dt"])
     return df
 
 
