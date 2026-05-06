@@ -33,6 +33,7 @@ from src.signal_tracker import (
     record_signal, check_and_update_signals,
     get_active_signals, get_active_signals_with_live_prices,
     get_closed_signals, get_performance_stats, manually_close_signal,
+    get_backend_info, export_signals_json, import_signals_json,
 )
 
 # ── Page Config ──────────────────────────────────────────────────────────────
@@ -769,6 +770,61 @@ st.markdown("""
 <h2 style="margin-top:0.5rem;">Signal Journal</h2>
 """, unsafe_allow_html=True)
 st.caption("Signals are auto-saved when the screener runs. They are tracked until target or stop-loss is hit.")
+
+# ── Backend status banner ──────────────────────────────────────────────────
+backend = get_backend_info()
+if backend["persistent"]:
+    st.markdown(f"""
+    <div style="background:rgba(38,166,154,0.08); border:1px solid rgba(38,166,154,0.3);
+                border-radius:6px; padding:8px 14px; margin-bottom:0.5rem; font-size:0.85rem;">
+        <span style="background:#26a69a; color:#fff; font-weight:700; font-size:0.7rem;
+                     padding:2px 8px; border-radius:3px; letter-spacing:0.05em;">PERSISTENT</span>
+        &nbsp; <strong>{backend['backend']}</strong> — {backend['info']}
+    </div>
+    """, unsafe_allow_html=True)
+else:
+    with st.expander("⚠️ Signals may be lost on Streamlit Cloud restarts — click for fix"):
+        st.warning(
+            f"**Backend:** {backend['backend']}\n\n"
+            f"**Issue:** {backend['info']}\n\n"
+            "**Permanent Fix (5 min):**\n\n"
+            "1. Sign up at [supabase.com](https://supabase.com) (free)\n"
+            "2. Create a new project, go to **Project Settings > Database**\n"
+            "3. Copy the **Connection String (URI)** under 'Connection Pooling'\n"
+            "4. Go to your Streamlit Cloud app → **Settings → Secrets**\n"
+            "5. Add: `DATABASE_URL = \"postgresql://...your-string...\"`\n"
+            "6. Save — your app will redeploy and use Postgres permanently\n\n"
+            "**Quick Fix:** Use the Backup/Restore section below to manually save your signals."
+        )
+
+# ── Backup / Restore ────────────────────────────────────────────────────────
+with st.expander("Backup / Restore Signals (JSON)"):
+    bcol1, bcol2 = st.columns(2)
+    with bcol1:
+        st.markdown("**Download Backup**")
+        try:
+            backup_json = export_signals_json()
+            count_in_backup = backup_json.count('"id"') if backup_json != "[]" else 0
+            st.download_button(
+                f"Download {count_in_backup} signal(s)",
+                backup_json,
+                f"signals_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                "application/json",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.error(f"Backup failed: {e}")
+    with bcol2:
+        st.markdown("**Upload Backup**")
+        uploaded = st.file_uploader("Choose a backup JSON", type=["json"], label_visibility="collapsed")
+        if uploaded is not None:
+            try:
+                content = uploaded.read().decode("utf-8")
+                imported = import_signals_json(content)
+                st.success(f"Imported {imported} signal(s) (duplicates skipped)")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Restore failed: {e}")
 
 # Check signals button
 jcol1, jcol2 = st.columns([1, 3])
