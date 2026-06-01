@@ -25,10 +25,15 @@ from src.config import (
     VCP_MAX_FROM_52W_HIGH_PCT, VCP_MIN_ABOVE_52W_LOW_PCT, VCP_BASE_LENGTH,
     VCP_MIN_CONTRACTIONS, VCP_VOL_CONTRACTION_RATIO, VCP_BREAKOUT_VOL_MULT,
     VCP_PIVOT_PROXIMITY_PCT,
+    BB_PERIOD, BB_STD_DEV, BB_SQUEEZE_LOOKBACK_DAILY, BB_SQUEEZE_LOOKBACK_WEEKLY,
+    BB_SQUEEZE_PERCENTILE, BB_BREAKOUT_LOOKBACK, BB_BREAKOUT_VOL_MULT,
 )
 from src.stock_universe import fetch_nifty500_tickers, fetch_nifty250_tickers
 from src.data_fetcher import fetch_bulk_price_data, fetch_fundamentals
-from src.technicals import screen_technical, screen_ema200_breakout, screen_vcp, calc_ema, calc_rsi, calc_atr, calc_adx
+from src.technicals import (
+    screen_technical, screen_ema200_breakout, screen_vcp, screen_bb_squeeze,
+    calc_ema, calc_rsi, calc_atr, calc_adx, calc_bollinger_bands,
+)
 from src.signal_tracker import (
     record_signal, check_and_update_signals,
     get_active_signals, get_active_signals_with_live_prices,
@@ -145,18 +150,27 @@ st.sidebar.title("Screener Filters")
 STRATEGY_SWING = "Swing Trade (EMA Crossover + ADX)"
 STRATEGY_BREAKOUT = "EMA 200 Breakout (Nifty 250)"
 STRATEGY_VCP = "VCP - Volatility Contraction"
+STRATEGY_BB_DAILY = "BB Squeeze - Daily"
+STRATEGY_BB_WEEKLY = "BB Squeeze - Weekly"
 strategy = st.sidebar.radio(
     "Strategy",
-    [STRATEGY_SWING, STRATEGY_BREAKOUT, STRATEGY_VCP],
+    [STRATEGY_SWING, STRATEGY_BREAKOUT, STRATEGY_VCP, STRATEGY_BB_DAILY, STRATEGY_BB_WEEKLY],
     help="**Swing Trade**: Nifty 500, recent 200 EMA crossover with volume spike, RSI 50-70, ADX > 20.\n\n"
          "**EMA 200 Breakout**: Nifty 250, recent 200 EMA crossover + good fundamentals. "
          "Less strict than swing (no RSI/ADX filters). Catches NMDC-type breakout moves.\n\n"
          "**VCP**: Minervini-style pattern. Stocks near 52W highs with tightening "
-         "price contractions and volume dry-up, ready to break out.",
+         "price contractions and volume dry-up, ready to break out.\n\n"
+         "**BB Squeeze Daily**: Bollinger Band squeeze - bandwidth at multi-month "
+         "low, then breakout above upper band with volume.\n\n"
+         "**BB Squeeze Weekly**: Same concept on weekly bars - captures larger "
+         "consolidations and bigger breakout moves (slower but cleaner setups).",
 )
 
 is_swing = (strategy == STRATEGY_SWING)
 is_vcp = (strategy == STRATEGY_VCP)
+is_bb_daily = (strategy == STRATEGY_BB_DAILY)
+is_bb_weekly = (strategy == STRATEGY_BB_WEEKLY)
+is_bb = is_bb_daily or is_bb_weekly
 
 # Technical filters vary by strategy
 st.sidebar.subheader("Technical")
@@ -174,6 +188,19 @@ elif is_vcp:
     f_vcp_vol_contraction = st.sidebar.slider("Vol Contraction Ratio", 0.3, 1.0, VCP_VOL_CONTRACTION_RATIO, 0.05)
     f_vcp_pivot_proximity = st.sidebar.slider("Max % below Pivot", 1.0, 10.0, VCP_PIVOT_PROXIMITY_PCT, 0.5)
     f_vcp_breakout_vol = st.sidebar.slider("Breakout Vol Multiplier", 1.0, 4.0, VCP_BREAKOUT_VOL_MULT, 0.1)
+elif is_bb:
+    f_bb_period = st.sidebar.slider("BB Period", 10, 50, BB_PERIOD)
+    f_bb_std = st.sidebar.slider("BB Std Dev", 1.5, 3.0, BB_STD_DEV, 0.1)
+    if is_bb_daily:
+        f_bb_lookback = st.sidebar.slider("Squeeze Lookback (days)", 30, 250, BB_SQUEEZE_LOOKBACK_DAILY, 10)
+        f_bb_breakout_lookback = st.sidebar.slider("Breakout Window (days)", 0, 10, BB_BREAKOUT_LOOKBACK)
+    else:
+        f_bb_lookback = st.sidebar.slider("Squeeze Lookback (weeks)", 10, 52, BB_SQUEEZE_LOOKBACK_WEEKLY)
+        f_bb_breakout_lookback = st.sidebar.slider("Breakout Window (weeks)", 0, 6, 3)
+    f_bb_percentile = st.sidebar.slider("Squeeze Tightness (lower = tighter)", 5.0, 40.0, BB_SQUEEZE_PERCENTILE, 1.0)
+    f_bb_vol = st.sidebar.slider("Breakout Vol Multiplier", 1.0, 4.0, BB_BREAKOUT_VOL_MULT, 0.1)
+    f_bb_require_trend = st.sidebar.checkbox("Require Uptrend Filter", value=True,
+                                              help="Daily: Price > EMA200. Weekly: Price > EMA20.")
 else:
     f_max_above_ema = st.sidebar.slider("Max % above EMA200", 3.0, 25.0, 15.0, 0.5)
     f_lookback = st.sidebar.slider("Crossover Lookback (days)", 0, 7, 7)
@@ -318,6 +345,23 @@ def screen_vcp_with_params(df: pd.DataFrame) -> dict | None:
     )
 
 
+# ── Helper: BB Squeeze screen with sidebar values ────────────────────────────
+def screen_bb_with_params(df: pd.DataFrame) -> dict | None:
+    """BB Squeeze screen using sidebar filter values."""
+    tf = "daily" if is_bb_daily else "weekly"
+    return screen_bb_squeeze(
+        df,
+        timeframe=tf,
+        bb_period=f_bb_period,
+        bb_std=f_bb_std,
+        squeeze_lookback=f_bb_lookback,
+        squeeze_percentile=f_bb_percentile,
+        breakout_lookback=f_bb_breakout_lookback,
+        vol_mult=f_bb_vol,
+        require_trend=f_bb_require_trend,
+    )
+
+
 # ── Helper: candlestick chart ────────────────────────────────────────────────
 def make_chart(symbol: str, df: pd.DataFrame) -> go.Figure:
     """Build candlestick + EMA + volume chart for a stock."""
@@ -408,6 +452,10 @@ if is_swing:
     universe_label, strategy_label = "Nifty 500", "EMA Crossover + ADX"
 elif is_vcp:
     universe_label, strategy_label = "Nifty 500", "VCP (Volatility Contraction)"
+elif is_bb_daily:
+    universe_label, strategy_label = "Nifty 500", "BB Squeeze (Daily)"
+elif is_bb_weekly:
+    universe_label, strategy_label = "Nifty 500", "BB Squeeze (Weekly)"
 else:
     universe_label, strategy_label = "Nifty 250", "EMA 200 Breakout"
 
@@ -464,7 +512,7 @@ st.divider()
 if st.button("Run Screener", type="primary", use_container_width=True):
     # ── Step 1: Tickers ──────────────────────────────────────────────────
     with st.spinner(f"Fetching {universe_label} ticker list..."):
-        if is_swing or is_vcp:
+        if is_swing or is_vcp or is_bb:
             symbols = fetch_nifty500_tickers()
         else:
             symbols = fetch_nifty250_tickers()
@@ -484,6 +532,8 @@ if st.button("Run Screener", type="primary", use_container_width=True):
             result = screen_with_params(df)
         elif is_vcp:
             result = screen_vcp_with_params(df)
+        elif is_bb:
+            result = screen_bb_with_params(df)
         else:
             result = screen_breakout_with_params(df)
         if result is not None:
@@ -579,6 +629,8 @@ if "results" in st.session_state:
     last_strategy = st.session_state.get("strategy", STRATEGY_SWING)
     last_is_swing = (last_strategy == STRATEGY_SWING)
     last_is_vcp = (last_strategy == STRATEGY_VCP)
+    last_is_bb = (last_strategy in (STRATEGY_BB_DAILY, STRATEGY_BB_WEEKLY))
+    last_is_bb_weekly = (last_strategy == STRATEGY_BB_WEEKLY)
 
     # ── Main results table ───────────────────────────────────────────────
     if results:
@@ -602,6 +654,17 @@ if "results" in st.session_state:
                 "pct_from_52w_high", "rsi",
                 "contraction_ratio", "vol_contraction", "breakout_vol_ratio",
                 "base_depth_pct", "stop_loss", "sl_pct",
+                "avg_traded_value_cr",
+                "market_cap_cr", "sales_growth_pct", "profit_growth_pct",
+                "roe_pct", "debt_to_equity", "operating_cashflow_cr",
+                "promoter_holding_pct",
+            ]
+        elif last_is_bb:
+            display_cols = [
+                "symbol", "price", "bb_status", "squeeze_intensity",
+                "bb_upper", "bb_middle", "bb_lower", "bb_width_pct",
+                "breakout_date", "days_since_breakout", "breakout_vol_ratio",
+                "rsi", "stop_loss", "sl_pct", "pct_from_52w_high",
                 "avg_traded_value_cr",
                 "market_cap_cr", "sales_growth_pct", "profit_growth_pct",
                 "roe_pct", "debt_to_equity", "operating_cashflow_cr",
@@ -633,6 +696,11 @@ if "results" in st.session_state:
             "vcp_status": "Status", "pivot_high": "Pivot", "pct_below_pivot": "%<Pivot",
             "contraction_ratio": "Contraction", "vol_contraction": "VolDryUp",
             "breakout_vol_ratio": "BrkoutVol", "base_depth_pct": "BaseDepth%",
+            # BB-specific
+            "bb_status": "Status", "squeeze_intensity": "Squeeze%",
+            "bb_upper": "BB Upper", "bb_middle": "BB Mid", "bb_lower": "BB Lower",
+            "bb_width_pct": "BB Width%", "breakout_date": "Brkout Date",
+            "days_since_breakout": "Brkout Age",
         }
         show_df = res_df[display_cols].rename(columns=col_rename)
 
@@ -640,6 +708,9 @@ if "results" in st.session_state:
         if last_is_vcp:
             if "%<Pivot" in show_df.columns:
                 show_df = show_df.sort_values("%<Pivot", ascending=True)
+        elif last_is_bb:
+            if "Squeeze%" in show_df.columns:
+                show_df = show_df.sort_values("Squeeze%", ascending=False)
         elif "Days" in show_df.columns:
             show_df = show_df.sort_values("Days", ascending=True)
         elif "%>EMA200" in show_df.columns:
@@ -666,6 +737,11 @@ if "results" in st.session_state:
                     label = (f"{sym} - Rs.{row['price']} | {row['vcp_status']} | "
                              f"Pivot Rs.{row['pivot_high']} ({row['pct_below_pivot']}% below) | "
                              f"SL Rs.{row['stop_loss']}")
+                elif last_is_bb:
+                    tf_label = "Weekly" if last_is_bb_weekly else "Daily"
+                    label = (f"{sym} - Rs.{row['price']} | {row['bb_status']} ({tf_label}) | "
+                             f"Squeeze {row['squeeze_intensity']}% | "
+                             f"BB Upper Rs.{row['bb_upper']} | SL Rs.{row['stop_loss']}")
                 else:
                     days = row.get('days_since_crossover', '?')
                     label = (f"{sym} - Rs.{row['price']} | {row.get('pct_above_ema200', '?')}% > EMA200 | "
@@ -684,6 +760,15 @@ if "results" in st.session_state:
                                    f"{row['pct_below_pivot']}% below")
                         tc4.metric("Vol Dry-Up", f"{row['vol_contraction']}x",
                                    f"Brkout {row['breakout_vol_ratio']}x")
+                        tc5.metric("% from 52W High", f"{row['pct_from_52w_high']}%")
+                    elif last_is_bb:
+                        tc1, tc2, tc3, tc4, tc5 = st.columns(5)
+                        tc1.metric("Entry", f"Rs.{row['price']}")
+                        tc2.metric("Stop Loss (BB Mid)", f"Rs.{row['stop_loss']}", f"-{row['sl_pct']}%")
+                        tc3.metric("BB Upper", f"Rs.{row['bb_upper']}",
+                                   f"Width {row['bb_width_pct']}%")
+                        tc4.metric("Squeeze Intensity", f"{row['squeeze_intensity']}%",
+                                   f"Vol {row.get('breakout_vol_ratio', 0)}x")
                         tc5.metric("% from 52W High", f"{row['pct_from_52w_high']}%")
                     else:
                         tc1, tc2, tc3, tc4, tc5 = st.columns(5)
@@ -718,6 +803,10 @@ if "results" in st.session_state:
             nm_cols = ["symbol", "price", "vcp_status", "pivot_high", "pct_below_pivot",
                        "pct_from_52w_high", "rsi", "contraction_ratio",
                        "vol_contraction", "stop_loss", "sl_pct", "fail_reason"]
+        elif last_is_bb:
+            nm_cols = ["symbol", "price", "bb_status", "squeeze_intensity",
+                       "bb_upper", "bb_width_pct", "breakout_vol_ratio",
+                       "rsi", "stop_loss", "sl_pct", "fail_reason"]
         else:
             nm_cols = ["symbol", "price", "pct_above_ema200", "rsi", "crossover_date",
                        "days_since_crossover", "crossover_vol_ratio",

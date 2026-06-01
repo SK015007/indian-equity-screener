@@ -25,6 +25,16 @@ VCP_VOL_CONTRACTION_RATIO = 0.8   # Recent vol / prior vol must be below this
 VCP_BREAKOUT_VOL_MULT = 1.5       # Min volume ratio on breakout vs 50-day avg
 VCP_PIVOT_PROXIMITY_PCT = 3.0     # Max % below pivot high to qualify
 
+# === Bollinger Band Squeeze ===
+BB_PERIOD = 20                    # Bollinger band SMA period
+BB_STD_DEV = 2.0                  # Number of std deviations for bands
+BB_SQUEEZE_LOOKBACK_DAILY = 120   # Days to compare current bandwidth against
+BB_SQUEEZE_LOOKBACK_WEEKLY = 26   # Weeks to compare current bandwidth against
+BB_SQUEEZE_PERCENTILE = 20.0      # Bandwidth must be in bottom X% of lookback
+BB_BREAKOUT_LOOKBACK = 5          # Allow breakout to have happened in last N bars
+BB_BREAKOUT_VOL_MULT = 1.5        # Volume multiplier on breakout day
+BB_MIN_TREND_FILTER = True        # Require price > EMA200 (daily) or EMA20 (weekly)
+
 # === Fundamental Conditions ===
 MIN_MARKET_CAP_CR = 1000       # Minimum market cap in crores (₹)
 MIN_SALES_GROWTH_PCT = 10.0    # Minimum YoY sales growth %
