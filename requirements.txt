@@ -4,4 +4,6 @@ numpy>=1.24
 requests>=2.31
 streamlit>=1.30
 plotly>=5.18
-psycopg2-binary>=2.9
+# Postgres support is optional - psycopg2-binary may fail to install on
+# some Streamlit Cloud builds. SQLite fallback always works.
+psycopg2-binary>=2.9; python_version>="3.8"
