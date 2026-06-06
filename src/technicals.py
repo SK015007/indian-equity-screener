@@ -12,7 +12,7 @@ from src.config import (
     VCP_PIVOT_PROXIMITY_PCT,
     BB_PERIOD, BB_STD_DEV, BB_SQUEEZE_LOOKBACK_DAILY, BB_SQUEEZE_LOOKBACK_WEEKLY,
     BB_SQUEEZE_PERCENTILE, BB_BREAKOUT_LOOKBACK, BB_BREAKOUT_VOL_MULT,
-    BB_MIN_TREND_FILTER,
+    BB_MIN_TREND_FILTER, KC_PERIOD, KC_ATR_MULT, BB_MIN_SQUEEZE_BARS,
 )
 
 
@@ -453,6 +453,19 @@ def calc_bollinger_bands(close: pd.Series, period: int = BB_PERIOD,
     return middle, upper, lower
 
 
+def calc_keltner_channels(high: pd.Series, low: pd.Series, close: pd.Series,
+                          period: int = KC_PERIOD, atr_mult: float = KC_ATR_MULT):
+    """Calculate Keltner Channels. Returns (middle, upper, lower).
+
+    Middle = EMA(close, period); bands = middle +/- (atr_mult * ATR).
+    """
+    middle = calc_ema(close, period)
+    atr = calc_atr(high, low, close, period)
+    upper = middle + atr_mult * atr
+    lower = middle - atr_mult * atr
+    return middle, upper, lower
+
+
 def _resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
     """Resample daily OHLCV to weekly bars (week ending Friday)."""
     if df is None or df.empty:
@@ -469,28 +482,40 @@ def _resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
 def screen_bb_squeeze(df: pd.DataFrame, timeframe: str = "daily",
                       bb_period: int = BB_PERIOD,
                       bb_std: float = BB_STD_DEV,
-                      squeeze_lookback=None,
-                      squeeze_percentile: float = BB_SQUEEZE_PERCENTILE,
+                      kc_period: int = KC_PERIOD,
+                      kc_atr_mult: float = KC_ATR_MULT,
+                      min_squeeze_bars: int = BB_MIN_SQUEEZE_BARS,
                       breakout_lookback: int = BB_BREAKOUT_LOOKBACK,
                       vol_mult: float = BB_BREAKOUT_VOL_MULT,
-                      require_trend: bool = BB_MIN_TREND_FILTER):
-    """Bollinger Band Squeeze & Breakout screener (daily or weekly)."""
+                      require_trend: bool = BB_MIN_TREND_FILTER,
+                      include_watchlist: bool = True):
+    """Bollinger Band Squeeze & Breakout screener using the TTM Squeeze method.
+
+    The TTM Squeeze (John Carter) is the professional way to detect a true
+    volatility squeeze and its release:
+
+      - Squeeze ON  : Bollinger Bands contract INSIDE the Keltner Channels
+                      (volatility is unusually low — the coiled spring)
+      - Squeeze FIRED: Bands expand back OUTSIDE the Keltner Channels
+                      (volatility expansion — the breakout)
+
+    We require the squeeze to have lasted at least `min_squeeze_bars` bars,
+    then look for a bullish release: price breaking up + volume increasing.
+
+    Returns dict with metrics if the stock qualifies, else None.
+    """
     if df is None or df.empty:
         return None
 
     # Resample to weekly if needed
     if timeframe == "weekly":
         work_df = _resample_weekly(df)
-        if squeeze_lookback is None:
-            squeeze_lookback = BB_SQUEEZE_LOOKBACK_WEEKLY
-        trend_ema_period = 20
-        min_bars_needed = max(bb_period, trend_ema_period, squeeze_lookback) + 5
+        trend_ema_period = 20            # ~5-month trend on weekly bars
+        min_bars_needed = max(bb_period, kc_period, trend_ema_period) + min_squeeze_bars + 5
     else:
         work_df = df
-        if squeeze_lookback is None:
-            squeeze_lookback = BB_SQUEEZE_LOOKBACK_DAILY
-        trend_ema_period = EMA_LONG
-        min_bars_needed = max(bb_period, trend_ema_period, squeeze_lookback) + 5
+        trend_ema_period = EMA_LONG      # 200-day trend
+        min_bars_needed = max(bb_period, kc_period, trend_ema_period) + min_squeeze_bars + 5
 
     if work_df is None or len(work_df) < min_bars_needed:
         return None
@@ -499,105 +524,149 @@ def screen_bb_squeeze(df: pd.DataFrame, timeframe: str = "daily",
     high = work_df["High"]
     low = work_df["Low"]
     volume = work_df["Volume"]
+    n = len(work_df)
 
-    # Bollinger Bands
+    # ── Bollinger Bands & Keltner Channels ──────────────────────────────
     bb_mid, bb_upper, bb_lower = calc_bollinger_bands(close, bb_period, bb_std)
-    bb_width_pct = ((bb_upper - bb_lower) / bb_mid) * 100
+    kc_mid, kc_upper, kc_lower = calc_keltner_channels(high, low, close, kc_period, kc_atr_mult)
 
-    # Trend filter
-    trend_ema = calc_ema(close, trend_ema_period)
+    # Squeeze ON: BB completely inside KC
+    squeeze_on = (bb_upper < kc_upper) & (bb_lower > kc_lower)
+
+    # Need valid values
+    if pd.isna(bb_upper.iloc[-1]) or pd.isna(kc_upper.iloc[-1]):
+        return None
+
     cp = float(close.iloc[-1])
-    ce = float(trend_ema.iloc[-1])
 
+    # ── Trend filter ────────────────────────────────────────────────────
+    trend_ema = calc_ema(close, trend_ema_period)
+    ce = float(trend_ema.iloc[-1])
     if require_trend and cp <= ce:
         return None
 
-    # Latest BB values
     cur_mid = float(bb_mid.iloc[-1])
     cur_upper = float(bb_upper.iloc[-1])
     cur_lower = float(bb_lower.iloc[-1])
-    cur_width = float(bb_width_pct.iloc[-1])
+    bb_width_pct_series = ((bb_upper - bb_lower) / bb_mid) * 100
+    cur_width = float(bb_width_pct_series.iloc[-1])
 
-    if np.isnan(cur_width):
-        return None
-
-    # Squeeze detection
-    lookback_widths = bb_width_pct.tail(squeeze_lookback).dropna()
-    if len(lookback_widths) < squeeze_lookback // 2:
-        return None
-
-    pct_threshold = float(np.percentile(lookback_widths, squeeze_percentile))
-    min_width = float(lookback_widths.min())
-    max_width = float(lookback_widths.max())
-
-    is_squeezed = cur_width <= pct_threshold
-
-    if max_width > min_width:
-        squeeze_intensity = round(
-            (1 - (cur_width - min_width) / (max_width - min_width)) * 100, 1
-        )
+    # ── BB width percentile (for "intensity" display) ───────────────────
+    lookback = BB_SQUEEZE_LOOKBACK_WEEKLY if timeframe == "weekly" else BB_SQUEEZE_LOOKBACK_DAILY
+    lookback_widths = bb_width_pct_series.tail(lookback).dropna()
+    if len(lookback_widths) >= 5:
+        min_w = float(lookback_widths.min())
+        max_w = float(lookback_widths.max())
+        if max_w > min_w:
+            squeeze_intensity = round((1 - (cur_width - min_w) / (max_w - min_w)) * 100, 1)
+        else:
+            squeeze_intensity = 100.0
     else:
-        squeeze_intensity = 100.0
+        squeeze_intensity = 0.0
 
-    # Breakout detection - scan last N bars
-    breakout_bar_idx = None
-    breakout_vol_ratio = 0.0
-    days_since_breakout = None
+    # ── Identify the squeeze / fire sequence ────────────────────────────
+    currently_on = bool(squeeze_on.iloc[-1])
+
+    # Count consecutive squeeze bars ending at the most recent ON bar
+    def _count_squeeze_run(end_idx: int) -> int:
+        c = 0
+        for k in range(end_idx, -1, -1):
+            if bool(squeeze_on.iloc[k]):
+                c += 1
+            else:
+                break
+        return c
 
     avg_vol = volume.rolling(VOLUME_AVG_PERIOD).mean()
-    scan_start = max(len(work_df) - 1 - breakout_lookback, 1)
-    for i in range(len(work_df) - 1, scan_start, -1):
-        if close.iloc[i] > bb_upper.iloc[i] and close.iloc[i - 1] <= bb_upper.iloc[i - 1]:
-            breakout_bar_idx = i
-            days_since_breakout = len(work_df) - 1 - i
-            v = volume.iloc[i]
-            av = avg_vol.iloc[i]
-            if not np.isnan(av) and av > 0:
-                breakout_vol_ratio = round(float(v / av), 2)
-            break
 
-    breakout_active = breakout_bar_idx is not None
-    above_upper = cp > cur_upper
+    status = None
+    squeeze_bars = 0
+    fired_idx = None
+    days_since_fire = None
+    breakout_vol_ratio = 0.0
+    fire_direction = None
 
-    # Status
-    if breakout_active and breakout_vol_ratio >= vol_mult:
-        status = "BREAKING OUT"
-    elif breakout_active:
-        status = "BREAKOUT (low vol)"
-    elif above_upper:
-        status = "ABOVE UPPER"
-    elif is_squeezed:
-        status = "IN SQUEEZE"
+    if currently_on:
+        # Still squeezing — watchlist candidate
+        squeeze_bars = _count_squeeze_run(n - 1)
+        if squeeze_bars >= min_squeeze_bars:
+            status = "SQUEEZE ON"
+        else:
+            return None  # squeeze too young, not meaningful yet
     else:
+        # Look for a recent fire (ON -> OFF transition) within breakout_lookback bars
+        scan_start = max(n - 1 - breakout_lookback, 1)
+        for i in range(n - 1, scan_start - 1, -1):
+            if not bool(squeeze_on.iloc[i]) and bool(squeeze_on.iloc[i - 1]):
+                fired_idx = i
+                break
+
+        if fired_idx is None:
+            return None  # no recent squeeze release — skip
+
+        # The squeeze that preceded the fire
+        squeeze_bars = _count_squeeze_run(fired_idx - 1)
+        if squeeze_bars < min_squeeze_bars:
+            return None
+
+        days_since_fire = (n - 1) - fired_idx
+
+        # Direction of the fire: compare close at fire to BB middle (momentum)
+        fire_close = float(close.iloc[fired_idx])
+        fire_mid = float(bb_mid.iloc[fired_idx])
+        fire_direction = "UP" if fire_close >= fire_mid else "DOWN"
+
+        # Volume on the fire bar
+        v = float(volume.iloc[fired_idx])
+        av = avg_vol.iloc[fired_idx]
+        if not pd.isna(av) and av > 0:
+            breakout_vol_ratio = round(v / av, 2)
+
+        # We only want bullish releases for a long screener
+        if fire_direction != "UP":
+            return None
+
+        # Also require price still holding above the BB middle now (not failed)
+        if cp < cur_mid:
+            return None
+
+        if breakout_vol_ratio >= vol_mult:
+            status = "FIRED UP"
+        else:
+            status = "FIRED UP (low vol)"
+
+    # If watchlist disabled, drop SQUEEZE ON rows
+    if status == "SQUEEZE ON" and not include_watchlist:
         return None
 
-    # Only return IN SQUEEZE if intensity is high
-    if status == "IN SQUEEZE" and squeeze_intensity < 70:
+    if status is None:
         return None
 
-    # Standard metrics
+    # ── Standard metrics ────────────────────────────────────────────────
     atr_series = calc_atr(high, low, close)
     cur_atr = float(atr_series.iloc[-1])
-
     rsi_series = calc_rsi(close)
     cur_rsi = float(rsi_series.iloc[-1])
 
     daily_recent = df.tail(VOLUME_AVG_PERIOD)
     avg_traded_value = float((daily_recent["Close"] * daily_recent["Volume"]).mean())
 
-    # Stop loss: max of BB middle and ATR-based SL
+    # Stop loss: max of BB middle (squeeze base) and ATR-based SL
     atr_sl = round(cp - ATR_SL_MULTIPLIER * cur_atr, 2)
     bb_mid_sl = round(cur_mid, 2)
     stop_loss = max(atr_sl, bb_mid_sl)
+    # Guard: SL must be below price
+    if stop_loss >= cp:
+        stop_loss = atr_sl
     sl_pct = round(((cp - stop_loss) / cp) * 100, 2)
 
     high_52w = float(df["High"].max())
     pct_from_52w_high = round(((high_52w - cp) / high_52w) * 100, 2)
 
-    breakout_date_str = ""
-    if breakout_bar_idx is not None:
-        bd = work_df.index[breakout_bar_idx]
-        breakout_date_str = bd.strftime("%Y-%m-%d") if hasattr(bd, "strftime") else str(bd)
+    fire_date_str = ""
+    if fired_idx is not None:
+        bd = work_df.index[fired_idx]
+        fire_date_str = bd.strftime("%Y-%m-%d") if hasattr(bd, "strftime") else str(bd)
 
     return {
         "price": round(cp, 2),
@@ -606,12 +675,14 @@ def screen_bb_squeeze(df: pd.DataFrame, timeframe: str = "daily",
         "bb_lower": round(cur_lower, 2),
         "bb_width_pct": round(cur_width, 2),
         "squeeze_intensity": squeeze_intensity,
+        "squeeze_bars": squeeze_bars,
         "bb_status": status,
+        "fire_direction": fire_direction if fire_direction else "",
+        "fire_date": fire_date_str,
+        "days_since_fire": days_since_fire if days_since_fire is not None else "",
+        "breakout_vol_ratio": breakout_vol_ratio,
         "rsi": round(cur_rsi, 2),
         "atr": round(cur_atr, 2),
-        "breakout_date": breakout_date_str,
-        "days_since_breakout": days_since_breakout if days_since_breakout is not None else "",
-        "breakout_vol_ratio": breakout_vol_ratio,
         "trend_ema": round(ce, 2),
         "avg_traded_value": avg_traded_value,
         "stop_loss": stop_loss,

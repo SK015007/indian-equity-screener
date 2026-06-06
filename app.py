@@ -27,6 +27,7 @@ from src.config import (
     VCP_PIVOT_PROXIMITY_PCT,
     BB_PERIOD, BB_STD_DEV, BB_SQUEEZE_LOOKBACK_DAILY, BB_SQUEEZE_LOOKBACK_WEEKLY,
     BB_SQUEEZE_PERCENTILE, BB_BREAKOUT_LOOKBACK, BB_BREAKOUT_VOL_MULT,
+    KC_PERIOD, KC_ATR_MULT, BB_MIN_SQUEEZE_BARS,
 )
 from src.stock_universe import fetch_nifty500_tickers, fetch_nifty250_tickers
 from src.data_fetcher import fetch_bulk_price_data, fetch_fundamentals
@@ -150,27 +151,35 @@ st.sidebar.title("Screener Filters")
 STRATEGY_SWING = "Swing Trade (EMA Crossover + ADX)"
 STRATEGY_BREAKOUT = "EMA 200 Breakout (Nifty 250)"
 STRATEGY_VCP = "VCP - Volatility Contraction"
-STRATEGY_BB_DAILY = "BB Squeeze - Daily"
-STRATEGY_BB_WEEKLY = "BB Squeeze - Weekly"
+STRATEGY_BB = "BB Squeeze (TTM)"
 strategy = st.sidebar.radio(
     "Strategy",
-    [STRATEGY_SWING, STRATEGY_BREAKOUT, STRATEGY_VCP, STRATEGY_BB_DAILY, STRATEGY_BB_WEEKLY],
+    [STRATEGY_SWING, STRATEGY_BREAKOUT, STRATEGY_VCP, STRATEGY_BB],
     help="**Swing Trade**: Nifty 500, recent 200 EMA crossover with volume spike, RSI 50-70, ADX > 20.\n\n"
          "**EMA 200 Breakout**: Nifty 250, recent 200 EMA crossover + good fundamentals. "
          "Less strict than swing (no RSI/ADX filters). Catches NMDC-type breakout moves.\n\n"
          "**VCP**: Minervini-style pattern. Stocks near 52W highs with tightening "
          "price contractions and volume dry-up, ready to break out.\n\n"
-         "**BB Squeeze Daily**: Bollinger Band squeeze - bandwidth at multi-month "
-         "low, then breakout above upper band with volume.\n\n"
-         "**BB Squeeze Weekly**: Same concept on weekly bars - captures larger "
-         "consolidations and bigger breakout moves (slower but cleaner setups).",
+         "**BB Squeeze (TTM)**: True volatility squeeze - Bollinger Bands contract "
+         "inside Keltner Channels (the coiled spring), then fire as bands expand "
+         "with a bullish breakout. Choose Daily or Weekly timeframe.",
 )
 
 is_swing = (strategy == STRATEGY_SWING)
 is_vcp = (strategy == STRATEGY_VCP)
-is_bb_daily = (strategy == STRATEGY_BB_DAILY)
-is_bb_weekly = (strategy == STRATEGY_BB_WEEKLY)
-is_bb = is_bb_daily or is_bb_weekly
+is_bb = (strategy == STRATEGY_BB)
+
+# Timeframe selector — only shown for BB Squeeze
+is_bb_daily = False
+is_bb_weekly = False
+if is_bb:
+    bb_timeframe = st.sidebar.radio(
+        "Timeframe", ["Daily", "Weekly"], horizontal=True,
+        help="Daily: faster, more signals. Weekly: bigger consolidations, "
+             "cleaner setups, larger moves (uses daily data resampled to weekly).",
+    )
+    is_bb_daily = (bb_timeframe == "Daily")
+    is_bb_weekly = (bb_timeframe == "Weekly")
 
 # Technical filters vary by strategy
 st.sidebar.subheader("Technical")
@@ -191,14 +200,17 @@ elif is_vcp:
 elif is_bb:
     f_bb_period = st.sidebar.slider("BB Period", 10, 50, BB_PERIOD)
     f_bb_std = st.sidebar.slider("BB Std Dev", 1.5, 3.0, BB_STD_DEV, 0.1)
+    f_kc_mult = st.sidebar.slider("Keltner ATR Mult", 1.0, 2.5, KC_ATR_MULT, 0.1,
+                                  help="Lower = stricter squeeze (bands must contract more)")
     if is_bb_daily:
-        f_bb_lookback = st.sidebar.slider("Squeeze Lookback (days)", 30, 250, BB_SQUEEZE_LOOKBACK_DAILY, 10)
-        f_bb_breakout_lookback = st.sidebar.slider("Breakout Window (days)", 0, 10, BB_BREAKOUT_LOOKBACK)
+        f_bb_min_squeeze = st.sidebar.slider("Min Squeeze Duration (days)", 3, 30, BB_MIN_SQUEEZE_BARS)
+        f_bb_breakout_lookback = st.sidebar.slider("Fire Window (days)", 0, 10, BB_BREAKOUT_LOOKBACK)
     else:
-        f_bb_lookback = st.sidebar.slider("Squeeze Lookback (weeks)", 10, 52, BB_SQUEEZE_LOOKBACK_WEEKLY)
-        f_bb_breakout_lookback = st.sidebar.slider("Breakout Window (weeks)", 0, 6, 3)
-    f_bb_percentile = st.sidebar.slider("Squeeze Tightness (lower = tighter)", 5.0, 40.0, BB_SQUEEZE_PERCENTILE, 1.0)
+        f_bb_min_squeeze = st.sidebar.slider("Min Squeeze Duration (weeks)", 3, 20, BB_MIN_SQUEEZE_BARS)
+        f_bb_breakout_lookback = st.sidebar.slider("Fire Window (weeks)", 0, 6, 3)
     f_bb_vol = st.sidebar.slider("Breakout Vol Multiplier", 1.0, 4.0, BB_BREAKOUT_VOL_MULT, 0.1)
+    f_bb_watchlist = st.sidebar.checkbox("Include 'Squeeze ON' watchlist", value=True,
+                                          help="Show stocks still squeezing (not yet fired) as watchlist candidates.")
     f_bb_require_trend = st.sidebar.checkbox("Require Uptrend Filter", value=True,
                                               help="Daily: Price > EMA200. Weekly: Price > EMA20.")
 else:
@@ -347,34 +359,37 @@ def screen_vcp_with_params(df: pd.DataFrame) -> dict | None:
 
 # ── Helper: BB Squeeze screen with sidebar values ────────────────────────────
 def screen_bb_with_params(df: pd.DataFrame) -> dict | None:
-    """BB Squeeze screen using sidebar filter values."""
+    """BB Squeeze (TTM) screen using sidebar filter values."""
     tf = "daily" if is_bb_daily else "weekly"
     return screen_bb_squeeze(
         df,
         timeframe=tf,
         bb_period=f_bb_period,
         bb_std=f_bb_std,
-        squeeze_lookback=f_bb_lookback,
-        squeeze_percentile=f_bb_percentile,
+        kc_atr_mult=f_kc_mult,
+        min_squeeze_bars=f_bb_min_squeeze,
         breakout_lookback=f_bb_breakout_lookback,
         vol_mult=f_bb_vol,
         require_trend=f_bb_require_trend,
+        include_watchlist=f_bb_watchlist,
     )
 
 
 # ── Helper: candlestick chart ────────────────────────────────────────────────
-def make_chart(symbol: str, df: pd.DataFrame) -> go.Figure:
-    """Build candlestick + EMA + volume chart for a stock."""
+def make_chart(symbol: str, df: pd.DataFrame, show_bb: bool = False) -> go.Figure:
+    """Build candlestick + EMA + volume chart for a stock.
+
+    If show_bb is True, overlays Bollinger Bands and Keltner Channels
+    (highlighting the squeeze) instead of the EMA stack.
+    """
     close = df["Close"]
-    ema200 = calc_ema(close, EMA_LONG)
-    ema50 = calc_ema(close, EMA_SHORT)
-    ema20 = calc_ema(close, 20)
     rsi = calc_rsi(close)
 
+    chart_title = f"{symbol} - {'BB Squeeze' if show_bb else 'Daily Chart'}"
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03,
         row_heights=[0.6, 0.2, 0.2],
-        subplot_titles=[f"{symbol} - Daily Chart", "Volume", "RSI (14)"],
+        subplot_titles=[chart_title, "Volume", "RSI (14)"],
     )
 
     # Candlestick
@@ -384,15 +399,38 @@ def make_chart(symbol: str, df: pd.DataFrame) -> go.Figure:
         increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
     ), row=1, col=1)
 
-    # EMAs
-    for ema, name, color in [
-        (ema20, "EMA 20", "#ffab40"),
-        (ema50, "EMA 50", "#42a5f5"),
-        (ema200, "EMA 200", "#ab47bc"),
-    ]:
-        fig.add_trace(go.Scatter(
-            x=df.index, y=ema, name=name, line=dict(width=1.5, color=color),
-        ), row=1, col=1)
+    if show_bb:
+        # Bollinger Bands + Keltner Channels overlay
+        from src.technicals import calc_keltner_channels
+        bb_mid, bb_upper, bb_lower = calc_bollinger_bands(close)
+        kc_mid, kc_upper, kc_lower = calc_keltner_channels(df["High"], df["Low"], close)
+
+        # Bollinger Bands (solid)
+        fig.add_trace(go.Scatter(x=df.index, y=bb_upper, name="BB Upper",
+                                 line=dict(width=1.5, color="#ef5350")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=bb_mid, name="BB Mid",
+                                 line=dict(width=1.2, color="#42a5f5")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=bb_lower, name="BB Lower",
+                                 line=dict(width=1.5, color="#26a69a"),
+                                 fill="tonexty", fillcolor="rgba(66,165,245,0.08)"), row=1, col=1)
+        # Keltner Channels (dashed) - squeeze visible when BB inside these
+        fig.add_trace(go.Scatter(x=df.index, y=kc_upper, name="KC Upper",
+                                 line=dict(width=1, color="#ffab40", dash="dot")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=kc_lower, name="KC Lower",
+                                 line=dict(width=1, color="#ffab40", dash="dot")), row=1, col=1)
+    else:
+        # EMA stack
+        ema200 = calc_ema(close, EMA_LONG)
+        ema50 = calc_ema(close, EMA_SHORT)
+        ema20 = calc_ema(close, 20)
+        for ema, name, color in [
+            (ema20, "EMA 20", "#ffab40"),
+            (ema50, "EMA 50", "#42a5f5"),
+            (ema200, "EMA 200", "#ab47bc"),
+        ]:
+            fig.add_trace(go.Scatter(
+                x=df.index, y=ema, name=name, line=dict(width=1.5, color=color),
+            ), row=1, col=1)
 
     # Volume
     colors = ["#26a69a" if c >= o else "#ef5350"
@@ -452,10 +490,9 @@ if is_swing:
     universe_label, strategy_label = "Nifty 500", "EMA Crossover + ADX"
 elif is_vcp:
     universe_label, strategy_label = "Nifty 500", "VCP (Volatility Contraction)"
-elif is_bb_daily:
-    universe_label, strategy_label = "Nifty 500", "BB Squeeze (Daily)"
-elif is_bb_weekly:
-    universe_label, strategy_label = "Nifty 500", "BB Squeeze (Weekly)"
+elif is_bb:
+    tf_name = "Daily" if is_bb_daily else "Weekly"
+    universe_label, strategy_label = "Nifty 500", f"BB Squeeze TTM ({tf_name})"
 else:
     universe_label, strategy_label = "Nifty 250", "EMA 200 Breakout"
 
@@ -586,6 +623,7 @@ if st.button("Run Screener", type="primary", use_container_width=True):
     st.session_state["near_miss"] = near_miss
     st.session_state["price_data"] = price_data
     st.session_state["strategy"] = strategy
+    st.session_state["bb_timeframe"] = ("Daily" if is_bb_daily else "Weekly") if is_bb else ""
     st.session_state["stats"] = {
         "universe": len(symbols),
         "price_ok": len(price_data),
@@ -629,8 +667,9 @@ if "results" in st.session_state:
     last_strategy = st.session_state.get("strategy", STRATEGY_SWING)
     last_is_swing = (last_strategy == STRATEGY_SWING)
     last_is_vcp = (last_strategy == STRATEGY_VCP)
-    last_is_bb = (last_strategy in (STRATEGY_BB_DAILY, STRATEGY_BB_WEEKLY))
-    last_is_bb_weekly = (last_strategy == STRATEGY_BB_WEEKLY)
+    last_is_bb = (last_strategy == STRATEGY_BB)
+    last_bb_tf = st.session_state.get("bb_timeframe", "")
+    last_is_bb_weekly = (last_bb_tf == "Weekly")
 
     # ── Main results table ───────────────────────────────────────────────
     if results:
@@ -661,9 +700,9 @@ if "results" in st.session_state:
             ]
         elif last_is_bb:
             display_cols = [
-                "symbol", "price", "bb_status", "squeeze_intensity",
-                "bb_upper", "bb_middle", "bb_lower", "bb_width_pct",
-                "breakout_date", "days_since_breakout", "breakout_vol_ratio",
+                "symbol", "price", "bb_status", "squeeze_bars", "squeeze_intensity",
+                "bb_upper", "bb_middle", "bb_width_pct",
+                "fire_date", "days_since_fire", "breakout_vol_ratio",
                 "rsi", "stop_loss", "sl_pct", "pct_from_52w_high",
                 "avg_traded_value_cr",
                 "market_cap_cr", "sales_growth_pct", "profit_growth_pct",
@@ -698,9 +737,10 @@ if "results" in st.session_state:
             "breakout_vol_ratio": "BrkoutVol", "base_depth_pct": "BaseDepth%",
             # BB-specific
             "bb_status": "Status", "squeeze_intensity": "Squeeze%",
+            "squeeze_bars": "Sqz Bars",
             "bb_upper": "BB Upper", "bb_middle": "BB Mid", "bb_lower": "BB Lower",
-            "bb_width_pct": "BB Width%", "breakout_date": "Brkout Date",
-            "days_since_breakout": "Brkout Age",
+            "bb_width_pct": "BB Width%", "fire_date": "Fire Date",
+            "days_since_fire": "Fire Age", "fire_direction": "Dir",
         }
         show_df = res_df[display_cols].rename(columns=col_rename)
 
@@ -709,8 +749,16 @@ if "results" in st.session_state:
             if "%<Pivot" in show_df.columns:
                 show_df = show_df.sort_values("%<Pivot", ascending=True)
         elif last_is_bb:
-            if "Squeeze%" in show_df.columns:
-                show_df = show_df.sort_values("Squeeze%", ascending=False)
+            # FIRED setups first (actionable), then by squeeze duration/intensity
+            if "Status" in show_df.columns:
+                status_order = {"FIRED UP": 0, "FIRED UP (low vol)": 1, "SQUEEZE ON": 2}
+                show_df["_ord"] = show_df["Status"].map(status_order).fillna(9)
+                sort_cols = ["_ord"]
+                if "Squeeze%" in show_df.columns:
+                    sort_cols.append("Squeeze%")
+                show_df = show_df.sort_values(
+                    sort_cols, ascending=[True] + [False] * (len(sort_cols) - 1)
+                ).drop(columns=["_ord"])
         elif "Days" in show_df.columns:
             show_df = show_df.sort_values("Days", ascending=True)
         elif "%>EMA200" in show_df.columns:
@@ -739,16 +787,17 @@ if "results" in st.session_state:
                              f"SL Rs.{row['stop_loss']}")
                 elif last_is_bb:
                     tf_label = "Weekly" if last_is_bb_weekly else "Daily"
+                    bars_unit = "wk" if last_is_bb_weekly else "d"
                     label = (f"{sym} - Rs.{row['price']} | {row['bb_status']} ({tf_label}) | "
-                             f"Squeeze {row['squeeze_intensity']}% | "
-                             f"BB Upper Rs.{row['bb_upper']} | SL Rs.{row['stop_loss']}")
+                             f"Squeezed {row.get('squeeze_bars', '?')}{bars_unit} | "
+                             f"Intensity {row['squeeze_intensity']}% | SL Rs.{row['stop_loss']}")
                 else:
                     days = row.get('days_since_crossover', '?')
                     label = (f"{sym} - Rs.{row['price']} | {row.get('pct_above_ema200', '?')}% > EMA200 | "
                              f"Crossover {days}d ago | VolRatio {row.get('crossover_vol_ratio', 'N/A')} | "
                              f"SL Rs.{row['stop_loss']}")
                 with st.expander(label, expanded=True):
-                    fig = make_chart(sym, price_data[sym].tail(120))
+                    fig = make_chart(sym, price_data[sym].tail(120), show_bb=last_is_bb)
                     st.plotly_chart(fig, use_container_width=True)
 
                     # Trade setup box - varies by strategy
@@ -762,13 +811,14 @@ if "results" in st.session_state:
                                    f"Brkout {row['breakout_vol_ratio']}x")
                         tc5.metric("% from 52W High", f"{row['pct_from_52w_high']}%")
                     elif last_is_bb:
+                        bars_unit = "wk" if last_is_bb_weekly else "d"
                         tc1, tc2, tc3, tc4, tc5 = st.columns(5)
                         tc1.metric("Entry", f"Rs.{row['price']}")
                         tc2.metric("Stop Loss (BB Mid)", f"Rs.{row['stop_loss']}", f"-{row['sl_pct']}%")
-                        tc3.metric("BB Upper", f"Rs.{row['bb_upper']}",
-                                   f"Width {row['bb_width_pct']}%")
+                        tc3.metric("Status", row['bb_status'],
+                                   f"Squeezed {row.get('squeeze_bars', '?')}{bars_unit}")
                         tc4.metric("Squeeze Intensity", f"{row['squeeze_intensity']}%",
-                                   f"Vol {row.get('breakout_vol_ratio', 0)}x")
+                                   f"Fire vol {row.get('breakout_vol_ratio', 0)}x")
                         tc5.metric("% from 52W High", f"{row['pct_from_52w_high']}%")
                     else:
                         tc1, tc2, tc3, tc4, tc5 = st.columns(5)
@@ -804,7 +854,7 @@ if "results" in st.session_state:
                        "pct_from_52w_high", "rsi", "contraction_ratio",
                        "vol_contraction", "stop_loss", "sl_pct", "fail_reason"]
         elif last_is_bb:
-            nm_cols = ["symbol", "price", "bb_status", "squeeze_intensity",
+            nm_cols = ["symbol", "price", "bb_status", "squeeze_bars", "squeeze_intensity",
                        "bb_upper", "bb_width_pct", "breakout_vol_ratio",
                        "rsi", "stop_loss", "sl_pct", "fail_reason"]
         else:
@@ -838,7 +888,7 @@ if "results" in st.session_state:
             if sym in price_data:
                 with st.expander(f"{sym} - Rs.{row['price']} | "
                                  f"Failed: {row.get('fail_reason', 'N/A')}"):
-                    fig = make_chart(sym, price_data[sym].tail(120))
+                    fig = make_chart(sym, price_data[sym].tail(120), show_bb=last_is_bb)
                     st.plotly_chart(fig, use_container_width=True)
 
 elif "stats" not in st.session_state:
