@@ -33,6 +33,7 @@ KC_ATR_MULT = 1.5                 # Keltner Channel ATR multiplier
 BB_MIN_SQUEEZE_BARS = 6           # Min consecutive bars in squeeze to qualify
 BB_BREAKOUT_LOOKBACK = 5          # Allow breakout/fire to have happened in last N bars
 BB_BREAKOUT_VOL_MULT = 1.5        # Volume multiplier on breakout day
+BB_MAX_ABOVE_PIVOT_PCT = 5.0      # Max % price can be above breakout pivot (early entry zone)
 BB_MIN_TREND_FILTER = True        # Require price > EMA200 (daily) or EMA20 (weekly)
 # Legacy (kept for compatibility / percentile intensity display)
 BB_SQUEEZE_LOOKBACK_DAILY = 120   # Days to compute squeeze intensity against

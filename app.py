@@ -27,7 +27,7 @@ from src.config import (
     VCP_PIVOT_PROXIMITY_PCT,
     BB_PERIOD, BB_STD_DEV, BB_SQUEEZE_LOOKBACK_DAILY, BB_SQUEEZE_LOOKBACK_WEEKLY,
     BB_SQUEEZE_PERCENTILE, BB_BREAKOUT_LOOKBACK, BB_BREAKOUT_VOL_MULT,
-    KC_PERIOD, KC_ATR_MULT, BB_MIN_SQUEEZE_BARS,
+    KC_PERIOD, KC_ATR_MULT, BB_MIN_SQUEEZE_BARS, BB_MAX_ABOVE_PIVOT_PCT,
 )
 from src.stock_universe import fetch_nifty500_tickers, fetch_nifty250_tickers
 from src.data_fetcher import fetch_bulk_price_data, fetch_fundamentals
@@ -209,6 +209,10 @@ elif is_bb:
         f_bb_min_squeeze = st.sidebar.slider("Min Squeeze Duration (weeks)", 3, 20, BB_MIN_SQUEEZE_BARS)
         f_bb_breakout_lookback = st.sidebar.slider("Fire Window (weeks)", 0, 6, 3)
     f_bb_vol = st.sidebar.slider("Breakout Vol Multiplier", 1.0, 4.0, BB_BREAKOUT_VOL_MULT, 0.1)
+    f_bb_max_above_pivot = st.sidebar.slider(
+        "Max % above breakout pivot", 1.0, 15.0, BB_MAX_ABOVE_PIVOT_PCT, 0.5,
+        help="Only flag stocks within this % above the breakout level (the 'orange line'). "
+             "Keeps entries early — before the stock extends too far into the rally.")
     f_bb_watchlist = st.sidebar.checkbox("Include 'Squeeze ON' watchlist", value=True,
                                           help="Show stocks still squeezing (not yet fired) as watchlist candidates.")
     f_bb_require_trend = st.sidebar.checkbox("Require Uptrend Filter", value=True,
@@ -372,15 +376,18 @@ def screen_bb_with_params(df: pd.DataFrame) -> dict | None:
         vol_mult=f_bb_vol,
         require_trend=f_bb_require_trend,
         include_watchlist=f_bb_watchlist,
+        max_above_pivot=f_bb_max_above_pivot,
     )
 
 
 # ── Helper: candlestick chart ────────────────────────────────────────────────
-def make_chart(symbol: str, df: pd.DataFrame, show_bb: bool = False) -> go.Figure:
+def make_chart(symbol: str, df: pd.DataFrame, show_bb: bool = False,
+               pivot_level: float | None = None) -> go.Figure:
     """Build candlestick + EMA + volume chart for a stock.
 
     If show_bb is True, overlays Bollinger Bands and Keltner Channels
     (highlighting the squeeze) instead of the EMA stack.
+    If pivot_level is given, draws it as an orange breakout line.
     """
     close = df["Close"]
     rsi = calc_rsi(close)
@@ -415,9 +422,14 @@ def make_chart(symbol: str, df: pd.DataFrame, show_bb: bool = False) -> go.Figur
                                  fill="tonexty", fillcolor="rgba(66,165,245,0.08)"), row=1, col=1)
         # Keltner Channels (dashed) - squeeze visible when BB inside these
         fig.add_trace(go.Scatter(x=df.index, y=kc_upper, name="KC Upper",
-                                 line=dict(width=1, color="#ffab40", dash="dot")), row=1, col=1)
+                                 line=dict(width=1, color="#ab47bc", dash="dot")), row=1, col=1)
         fig.add_trace(go.Scatter(x=df.index, y=kc_lower, name="KC Lower",
-                                 line=dict(width=1, color="#ffab40", dash="dot")), row=1, col=1)
+                                 line=dict(width=1, color="#ab47bc", dash="dot")), row=1, col=1)
+        # Breakout pivot — the "orange line" the rally launches from
+        if pivot_level is not None:
+            fig.add_hline(y=pivot_level, line_color="#ff9800", line_width=2,
+                          annotation_text=f"Pivot {pivot_level}",
+                          annotation_position="right", row=1, col=1)
     else:
         # EMA stack
         ema200 = calc_ema(close, EMA_LONG)
@@ -700,8 +712,8 @@ if "results" in st.session_state:
             ]
         elif last_is_bb:
             display_cols = [
-                "symbol", "price", "bb_status", "squeeze_bars", "squeeze_intensity",
-                "bb_upper", "bb_middle", "bb_width_pct",
+                "symbol", "price", "bb_status", "pivot", "pct_above_pivot",
+                "squeeze_bars", "squeeze_intensity", "bb_width_pct",
                 "fire_date", "days_since_fire", "breakout_vol_ratio",
                 "rsi", "stop_loss", "sl_pct", "pct_from_52w_high",
                 "avg_traded_value_cr",
@@ -741,6 +753,7 @@ if "results" in st.session_state:
             "bb_upper": "BB Upper", "bb_middle": "BB Mid", "bb_lower": "BB Lower",
             "bb_width_pct": "BB Width%", "fire_date": "Fire Date",
             "days_since_fire": "Fire Age", "fire_direction": "Dir",
+            "pivot": "Pivot", "pct_above_pivot": "%vs Pivot",
         }
         show_df = res_df[display_cols].rename(columns=col_rename)
 
@@ -797,7 +810,9 @@ if "results" in st.session_state:
                              f"Crossover {days}d ago | VolRatio {row.get('crossover_vol_ratio', 'N/A')} | "
                              f"SL Rs.{row['stop_loss']}")
                 with st.expander(label, expanded=True):
-                    fig = make_chart(sym, price_data[sym].tail(120), show_bb=last_is_bb)
+                    pivot_lvl = row.get("pivot") if last_is_bb else None
+                    fig = make_chart(sym, price_data[sym].tail(120),
+                                     show_bb=last_is_bb, pivot_level=pivot_lvl)
                     st.plotly_chart(fig, use_container_width=True)
 
                     # Trade setup box - varies by strategy
@@ -814,12 +829,13 @@ if "results" in st.session_state:
                         bars_unit = "wk" if last_is_bb_weekly else "d"
                         tc1, tc2, tc3, tc4, tc5 = st.columns(5)
                         tc1.metric("Entry", f"Rs.{row['price']}")
-                        tc2.metric("Stop Loss (BB Mid)", f"Rs.{row['stop_loss']}", f"-{row['sl_pct']}%")
-                        tc3.metric("Status", row['bb_status'],
+                        tc2.metric("Breakout Pivot", f"Rs.{row.get('pivot', '?')}",
+                                   f"{row.get('pct_above_pivot', 0):+.1f}% vs price")
+                        tc3.metric("Stop Loss", f"Rs.{row['stop_loss']}", f"-{row['sl_pct']}%")
+                        tc4.metric("Status", row['bb_status'],
                                    f"Squeezed {row.get('squeeze_bars', '?')}{bars_unit}")
-                        tc4.metric("Squeeze Intensity", f"{row['squeeze_intensity']}%",
-                                   f"Fire vol {row.get('breakout_vol_ratio', 0)}x")
-                        tc5.metric("% from 52W High", f"{row['pct_from_52w_high']}%")
+                        tc5.metric("Fire Vol", f"{row.get('breakout_vol_ratio', 0)}x",
+                                   f"Intensity {row['squeeze_intensity']}%")
                     else:
                         tc1, tc2, tc3, tc4, tc5 = st.columns(5)
                         tc1.metric("Entry", f"Rs.{row['price']}")
@@ -854,8 +870,9 @@ if "results" in st.session_state:
                        "pct_from_52w_high", "rsi", "contraction_ratio",
                        "vol_contraction", "stop_loss", "sl_pct", "fail_reason"]
         elif last_is_bb:
-            nm_cols = ["symbol", "price", "bb_status", "squeeze_bars", "squeeze_intensity",
-                       "bb_upper", "bb_width_pct", "breakout_vol_ratio",
+            nm_cols = ["symbol", "price", "bb_status", "pivot", "pct_above_pivot",
+                       "squeeze_bars", "squeeze_intensity",
+                       "bb_width_pct", "breakout_vol_ratio",
                        "rsi", "stop_loss", "sl_pct", "fail_reason"]
         else:
             nm_cols = ["symbol", "price", "pct_above_ema200", "rsi", "crossover_date",

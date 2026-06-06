@@ -13,6 +13,7 @@ from src.config import (
     BB_PERIOD, BB_STD_DEV, BB_SQUEEZE_LOOKBACK_DAILY, BB_SQUEEZE_LOOKBACK_WEEKLY,
     BB_SQUEEZE_PERCENTILE, BB_BREAKOUT_LOOKBACK, BB_BREAKOUT_VOL_MULT,
     BB_MIN_TREND_FILTER, KC_PERIOD, KC_ATR_MULT, BB_MIN_SQUEEZE_BARS,
+    BB_MAX_ABOVE_PIVOT_PCT,
 )
 
 
@@ -488,7 +489,8 @@ def screen_bb_squeeze(df: pd.DataFrame, timeframe: str = "daily",
                       breakout_lookback: int = BB_BREAKOUT_LOOKBACK,
                       vol_mult: float = BB_BREAKOUT_VOL_MULT,
                       require_trend: bool = BB_MIN_TREND_FILTER,
-                      include_watchlist: bool = True):
+                      include_watchlist: bool = True,
+                      max_above_pivot: float = BB_MAX_ABOVE_PIVOT_PCT):
     """Bollinger Band Squeeze & Breakout screener using the TTM Squeeze method.
 
     The TTM Squeeze (John Carter) is the professional way to detect a true
@@ -642,6 +644,31 @@ def screen_bb_squeeze(df: pd.DataFrame, timeframe: str = "daily",
     if status is None:
         return None
 
+    # ── Breakout pivot (the "orange line") ──────────────────────────────
+    # The pivot is the resistance ceiling of the consolidation base —
+    # the highest high during the squeeze period. Crossing it triggers
+    # the rally. We want to catch the stock NEAR this level, not extended.
+    if currently_on:
+        # Squeeze still forming — pivot = highest high of the squeeze so far
+        sq_start = max(n - squeeze_bars, 0)
+        squeeze_window_high = high.iloc[sq_start:n]
+    else:
+        # Squeeze fired — pivot = highest high during the squeeze that preceded it
+        sq_start = max(fired_idx - squeeze_bars, 0)
+        squeeze_window_high = high.iloc[sq_start:fired_idx]
+
+    if len(squeeze_window_high) > 0:
+        pivot_high = float(squeeze_window_high.max())
+    else:
+        pivot_high = cur_upper  # fallback
+
+    pct_above_pivot = round(((cp - pivot_high) / pivot_high) * 100, 2)
+
+    # Early-entry filter: for FIRED setups, skip if price already extended
+    # too far above the pivot (you've missed the clean entry).
+    if status.startswith("FIRED") and pct_above_pivot > max_above_pivot:
+        return None
+
     # ── Standard metrics ────────────────────────────────────────────────
     atr_series = calc_atr(high, low, close)
     cur_atr = float(atr_series.iloc[-1])
@@ -677,6 +704,8 @@ def screen_bb_squeeze(df: pd.DataFrame, timeframe: str = "daily",
         "squeeze_intensity": squeeze_intensity,
         "squeeze_bars": squeeze_bars,
         "bb_status": status,
+        "pivot": round(pivot_high, 2),
+        "pct_above_pivot": pct_above_pivot,
         "fire_direction": fire_direction if fire_direction else "",
         "fire_date": fire_date_str,
         "days_since_fire": days_since_fire if days_since_fire is not None else "",
