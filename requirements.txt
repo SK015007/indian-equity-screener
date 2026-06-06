@@ -4,6 +4,7 @@ numpy>=1.24
 requests>=2.31
 streamlit>=1.30
 plotly>=5.18
-# Postgres support is optional - psycopg2-binary may fail to install on
-# some Streamlit Cloud builds. SQLite fallback always works.
-psycopg2-binary>=2.9; python_version>="3.8"
+# NOTE: Postgres support (psycopg2-binary) is intentionally NOT listed here.
+# The app falls back to SQLite automatically when it's absent. Only add
+# "psycopg2-binary>=2.9" below if/when you set up a DATABASE_URL (Supabase),
+# so a failed build of this package can never take down the whole app.
