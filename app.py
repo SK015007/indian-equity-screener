@@ -28,11 +28,14 @@ from src.config import (
     BB_PERIOD, BB_STD_DEV, BB_SQUEEZE_LOOKBACK_DAILY, BB_SQUEEZE_LOOKBACK_WEEKLY,
     BB_SQUEEZE_PERCENTILE, BB_BREAKOUT_LOOKBACK, BB_BREAKOUT_VOL_MULT,
     KC_PERIOD, KC_ATR_MULT, BB_MIN_SQUEEZE_BARS, BB_MAX_ABOVE_PIVOT_PCT,
+    FHP_HIGH_LOOKBACK, FHP_MIN_RETRACE_PCT, FHP_MAX_RETRACE_PCT,
+    FHP_SUPPORT_EMA, FHP_NEAR_52W_PCT, FHP_MAX_ABOVE_SUPPORT_PCT,
 )
 from src.stock_universe import fetch_nifty500_tickers, fetch_nifty250_tickers
 from src.data_fetcher import fetch_bulk_price_data, fetch_fundamentals
 from src.technicals import (
     screen_technical, screen_ema200_breakout, screen_vcp, screen_bb_squeeze,
+    screen_fresh_high_pullback,
     calc_ema, calc_rsi, calc_atr, calc_adx, calc_bollinger_bands,
 )
 from src.signal_tracker import (
@@ -152,9 +155,10 @@ STRATEGY_SWING = "Swing Trade (EMA Crossover + ADX)"
 STRATEGY_BREAKOUT = "EMA 200 Breakout (Nifty 250)"
 STRATEGY_VCP = "VCP - Volatility Contraction"
 STRATEGY_BB = "BB Squeeze (TTM)"
+STRATEGY_FHP = "Fresh High Pullback"
 strategy = st.sidebar.radio(
     "Strategy",
-    [STRATEGY_SWING, STRATEGY_BREAKOUT, STRATEGY_VCP, STRATEGY_BB],
+    [STRATEGY_SWING, STRATEGY_BREAKOUT, STRATEGY_VCP, STRATEGY_BB, STRATEGY_FHP],
     help="**Swing Trade**: Nifty 500, recent 200 EMA crossover with volume spike, RSI 50-70, ADX > 20.\n\n"
          "**EMA 200 Breakout**: Nifty 250, recent 200 EMA crossover + good fundamentals. "
          "Less strict than swing (no RSI/ADX filters). Catches NMDC-type breakout moves.\n\n"
@@ -162,12 +166,15 @@ strategy = st.sidebar.radio(
          "price contractions and volume dry-up, ready to break out.\n\n"
          "**BB Squeeze (TTM)**: True volatility squeeze - Bollinger Bands contract "
          "inside Keltner Channels (the coiled spring), then fire as bands expand "
-         "with a bullish breakout. Choose Daily or Weekly timeframe.",
+         "with a bullish breakout. Choose Daily or Weekly timeframe.\n\n"
+         "**Fresh High Pullback**: Leaders that made a fresh high, then retraced to "
+         "support on lower volume - buy the dip/bounce. Lower risk than chasing highs.",
 )
 
 is_swing = (strategy == STRATEGY_SWING)
 is_vcp = (strategy == STRATEGY_VCP)
 is_bb = (strategy == STRATEGY_BB)
+is_fhp = (strategy == STRATEGY_FHP)
 
 # Timeframe selector — only shown for BB Squeeze
 is_bb_daily = False
@@ -217,6 +224,20 @@ elif is_bb:
                                           help="Show stocks still squeezing (not yet fired) as watchlist candidates.")
     f_bb_require_trend = st.sidebar.checkbox("Require Uptrend Filter", value=True,
                                               help="Daily: Price > EMA200. Weekly: Price > EMA20.")
+elif is_fhp:
+    f_fhp_high_lookback = st.sidebar.slider("Fresh High Lookback (days)", 20, 90, FHP_HIGH_LOOKBACK, 5,
+                                            help="Window to find the recent peak high.")
+    f_fhp_min_retrace = st.sidebar.slider("Min Retracement %", 1.0, 10.0, FHP_MIN_RETRACE_PCT, 0.5)
+    f_fhp_max_retrace = st.sidebar.slider("Max Retracement %", 8.0, 30.0, FHP_MAX_RETRACE_PCT, 1.0)
+    f_fhp_support_ema = st.sidebar.selectbox("Support EMA", [20, 50, 100], index=1,
+                                             help="Dynamic support the pullback should hold.")
+    f_fhp_near_52w = st.sidebar.slider("Peak within % of 52W High", 0.0, 20.0, FHP_NEAR_52W_PCT, 1.0,
+                                       help="Ensures it's a genuine fresh high (leadership), not a minor bounce.")
+    f_fhp_max_above_support = st.sidebar.slider("Max % above Support EMA", 2.0, 15.0, FHP_MAX_ABOVE_SUPPORT_PCT, 0.5)
+    f_fhp_require_bounce = st.sidebar.checkbox("Only show BOUNCING (entry trigger)", value=False,
+                                               help="If off, also shows PULLING BACK / AT SUPPORT watchlist setups.")
+    f_fhp_require_trend = st.sidebar.checkbox("Require Uptrend Filter", value=True,
+                                              help="Price > EMA200, support EMA > EMA200, EMA200 rising.")
 else:
     f_max_above_ema = st.sidebar.slider("Max % above EMA200", 3.0, 25.0, 15.0, 0.5)
     f_lookback = st.sidebar.slider("Crossover Lookback (days)", 0, 7, 7)
@@ -380,6 +401,22 @@ def screen_bb_with_params(df: pd.DataFrame) -> dict | None:
     )
 
 
+# ── Helper: Fresh High Pullback screen with sidebar values ───────────────────
+def screen_fhp_with_params(df: pd.DataFrame) -> dict | None:
+    """Fresh High Pullback screen using sidebar filter values."""
+    return screen_fresh_high_pullback(
+        df,
+        high_lookback=f_fhp_high_lookback,
+        min_retrace_pct=f_fhp_min_retrace,
+        max_retrace_pct=f_fhp_max_retrace,
+        support_ema=f_fhp_support_ema,
+        near_52w_pct=f_fhp_near_52w,
+        max_above_support=f_fhp_max_above_support,
+        require_trend=f_fhp_require_trend,
+        require_bounce=f_fhp_require_bounce,
+    )
+
+
 # ── Helper: candlestick chart ────────────────────────────────────────────────
 def make_chart(symbol: str, df: pd.DataFrame, show_bb: bool = False,
                pivot_level: float | None = None) -> go.Figure:
@@ -425,11 +462,6 @@ def make_chart(symbol: str, df: pd.DataFrame, show_bb: bool = False,
                                  line=dict(width=1, color="#ab47bc", dash="dot")), row=1, col=1)
         fig.add_trace(go.Scatter(x=df.index, y=kc_lower, name="KC Lower",
                                  line=dict(width=1, color="#ab47bc", dash="dot")), row=1, col=1)
-        # Breakout pivot — the "orange line" the rally launches from
-        if pivot_level is not None:
-            fig.add_hline(y=pivot_level, line_color="#ff9800", line_width=2,
-                          annotation_text=f"Pivot {pivot_level}",
-                          annotation_position="right", row=1, col=1)
     else:
         # EMA stack
         ema200 = calc_ema(close, EMA_LONG)
@@ -443,6 +475,12 @@ def make_chart(symbol: str, df: pd.DataFrame, show_bb: bool = False,
             fig.add_trace(go.Scatter(
                 x=df.index, y=ema, name=name, line=dict(width=1.5, color=color),
             ), row=1, col=1)
+
+    # Pivot / peak level line (orange) — breakout pivot (BB) or peak high (FHP)
+    if pivot_level is not None:
+        fig.add_hline(y=pivot_level, line_color="#ff9800", line_width=2,
+                      annotation_text=f"{pivot_level}",
+                      annotation_position="right", row=1, col=1)
 
     # Volume
     colors = ["#26a69a" if c >= o else "#ef5350"
@@ -505,6 +543,8 @@ elif is_vcp:
 elif is_bb:
     tf_name = "Daily" if is_bb_daily else "Weekly"
     universe_label, strategy_label = "Nifty 500", f"BB Squeeze TTM ({tf_name})"
+elif is_fhp:
+    universe_label, strategy_label = "Nifty 500", "Fresh High Pullback"
 else:
     universe_label, strategy_label = "Nifty 250", "EMA 200 Breakout"
 
@@ -561,7 +601,7 @@ st.divider()
 if st.button("Run Screener", type="primary", use_container_width=True):
     # ── Step 1: Tickers ──────────────────────────────────────────────────
     with st.spinner(f"Fetching {universe_label} ticker list..."):
-        if is_swing or is_vcp or is_bb:
+        if is_swing or is_vcp or is_bb or is_fhp:
             symbols = fetch_nifty500_tickers()
         else:
             symbols = fetch_nifty250_tickers()
@@ -583,6 +623,8 @@ if st.button("Run Screener", type="primary", use_container_width=True):
             result = screen_vcp_with_params(df)
         elif is_bb:
             result = screen_bb_with_params(df)
+        elif is_fhp:
+            result = screen_fhp_with_params(df)
         else:
             result = screen_breakout_with_params(df)
         if result is not None:
@@ -682,6 +724,7 @@ if "results" in st.session_state:
     last_is_bb = (last_strategy == STRATEGY_BB)
     last_bb_tf = st.session_state.get("bb_timeframe", "")
     last_is_bb_weekly = (last_bb_tf == "Weekly")
+    last_is_fhp = (last_strategy == STRATEGY_FHP)
 
     # ── Main results table ───────────────────────────────────────────────
     if results:
@@ -721,6 +764,17 @@ if "results" in st.session_state:
                 "roe_pct", "debt_to_equity", "operating_cashflow_cr",
                 "promoter_holding_pct",
             ]
+        elif last_is_fhp:
+            display_cols = [
+                "symbol", "price", "fhp_status", "peak_high", "retrace_pct",
+                "days_since_peak", "support_ema", "pct_above_support", "vol_dryup",
+                "target", "upside_to_target_pct", "rr_to_peak",
+                "rsi", "stop_loss", "sl_pct", "pct_from_52w_high",
+                "avg_traded_value_cr",
+                "market_cap_cr", "sales_growth_pct", "profit_growth_pct",
+                "roe_pct", "debt_to_equity", "operating_cashflow_cr",
+                "promoter_holding_pct",
+            ]
         else:
             display_cols = [
                 "symbol", "price", "ema200", "ema50", "pct_above_ema200",
@@ -754,6 +808,12 @@ if "results" in st.session_state:
             "bb_width_pct": "BB Width%", "fire_date": "Fire Date",
             "days_since_fire": "Fire Age", "fire_direction": "Dir",
             "pivot": "Pivot", "pct_above_pivot": "%vs Pivot",
+            # FHP-specific
+            "fhp_status": "Status", "peak_high": "Peak", "retrace_pct": "Retrace%",
+            "days_since_peak": "Peak Age", "support_ema": "Support",
+            "pct_above_support": "%vs Sup", "vol_dryup": "VolDryUp",
+            "target": "Target", "upside_to_target_pct": "Upside%",
+            "rr_to_peak": "R:R",
         }
         show_df = res_df[display_cols].rename(columns=col_rename)
 
@@ -769,6 +829,17 @@ if "results" in st.session_state:
                 sort_cols = ["_ord"]
                 if "Squeeze%" in show_df.columns:
                     sort_cols.append("Squeeze%")
+                show_df = show_df.sort_values(
+                    sort_cols, ascending=[True] + [False] * (len(sort_cols) - 1)
+                ).drop(columns=["_ord"])
+        elif last_is_fhp:
+            # BOUNCING (entry) first, then AT SUPPORT, then PULLING BACK; best R:R first
+            if "Status" in show_df.columns:
+                status_order = {"BOUNCING": 0, "AT SUPPORT": 1, "PULLING BACK": 2}
+                show_df["_ord"] = show_df["Status"].map(status_order).fillna(9)
+                sort_cols = ["_ord"]
+                if "R:R" in show_df.columns:
+                    sort_cols.append("R:R")
                 show_df = show_df.sort_values(
                     sort_cols, ascending=[True] + [False] * (len(sort_cols) - 1)
                 ).drop(columns=["_ord"])
@@ -804,6 +875,10 @@ if "results" in st.session_state:
                     label = (f"{sym} - Rs.{row['price']} | {row['bb_status']} ({tf_label}) | "
                              f"Squeezed {row.get('squeeze_bars', '?')}{bars_unit} | "
                              f"Intensity {row['squeeze_intensity']}% | SL Rs.{row['stop_loss']}")
+                elif last_is_fhp:
+                    label = (f"{sym} - Rs.{row['price']} | {row['fhp_status']} | "
+                             f"Peak Rs.{row['peak_high']} (retraced {row['retrace_pct']}%) | "
+                             f"Target Rs.{row['target']} | R:R {row['rr_to_peak']} | SL Rs.{row['stop_loss']}")
                 else:
                     days = row.get('days_since_crossover', '?')
                     label = (f"{sym} - Rs.{row['price']} | {row.get('pct_above_ema200', '?')}% > EMA200 | "
@@ -811,6 +886,9 @@ if "results" in st.session_state:
                              f"SL Rs.{row['stop_loss']}")
                 with st.expander(label, expanded=True):
                     pivot_lvl = row.get("pivot") if last_is_bb else None
+                    # For FHP, draw the peak (resistance/target) line
+                    if last_is_fhp:
+                        pivot_lvl = row.get("peak_high")
                     fig = make_chart(sym, price_data[sym].tail(120),
                                      show_bb=last_is_bb, pivot_level=pivot_lvl)
                     st.plotly_chart(fig, use_container_width=True)
@@ -836,6 +914,16 @@ if "results" in st.session_state:
                                    f"Squeezed {row.get('squeeze_bars', '?')}{bars_unit}")
                         tc5.metric("Fire Vol", f"{row.get('breakout_vol_ratio', 0)}x",
                                    f"Intensity {row['squeeze_intensity']}%")
+                    elif last_is_fhp:
+                        tc1, tc2, tc3, tc4, tc5 = st.columns(5)
+                        tc1.metric("Entry", f"Rs.{row['price']}")
+                        tc2.metric("Stop Loss", f"Rs.{row['stop_loss']}", f"-{row['sl_pct']}%")
+                        tc3.metric("Target (Peak)", f"Rs.{row['target']}",
+                                   f"+{row['upside_to_target_pct']}%")
+                        tc4.metric("R:R to Peak", f"{row['rr_to_peak']}",
+                                   f"Retraced {row['retrace_pct']}%")
+                        tc5.metric("Status", row['fhp_status'],
+                                   f"{row['pct_above_support']:+.1f}% vs support")
                     else:
                         tc1, tc2, tc3, tc4, tc5 = st.columns(5)
                         tc1.metric("Entry", f"Rs.{row['price']}")
@@ -874,6 +962,10 @@ if "results" in st.session_state:
                        "squeeze_bars", "squeeze_intensity",
                        "bb_width_pct", "breakout_vol_ratio",
                        "rsi", "stop_loss", "sl_pct", "fail_reason"]
+        elif last_is_fhp:
+            nm_cols = ["symbol", "price", "fhp_status", "peak_high", "retrace_pct",
+                       "pct_above_support", "vol_dryup", "rr_to_peak",
+                       "rsi", "stop_loss", "sl_pct", "fail_reason"]
         else:
             nm_cols = ["symbol", "price", "pct_above_ema200", "rsi", "crossover_date",
                        "days_since_crossover", "crossover_vol_ratio",
@@ -891,6 +983,11 @@ if "results" in st.session_state:
             "vcp_status": "Status", "pivot_high": "Pivot", "pct_below_pivot": "%<Pivot",
             "pct_from_52w_high": "%<52wH", "contraction_ratio": "Contraction",
             "vol_contraction": "VolDryUp",
+            "bb_status": "Status", "pivot": "Pivot", "pct_above_pivot": "%vs Pivot",
+            "squeeze_bars": "Sqz Bars", "squeeze_intensity": "Squeeze%",
+            "bb_width_pct": "BB Width%", "breakout_vol_ratio": "BrkoutVol",
+            "fhp_status": "Status", "peak_high": "Peak", "retrace_pct": "Retrace%",
+            "pct_above_support": "%vs Sup", "vol_dryup": "VolDryUp", "rr_to_peak": "R:R",
         }
         nm_show = nm_df[nm_cols].rename(columns=nm_rename)
         if last_is_vcp and "%<Pivot" in nm_show.columns:

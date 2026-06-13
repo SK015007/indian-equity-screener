@@ -14,6 +14,9 @@ from src.config import (
     BB_SQUEEZE_PERCENTILE, BB_BREAKOUT_LOOKBACK, BB_BREAKOUT_VOL_MULT,
     BB_MIN_TREND_FILTER, KC_PERIOD, KC_ATR_MULT, BB_MIN_SQUEEZE_BARS,
     BB_MAX_ABOVE_PIVOT_PCT,
+    FHP_HIGH_LOOKBACK, FHP_MIN_RETRACE_PCT, FHP_MAX_RETRACE_PCT,
+    FHP_SUPPORT_EMA, FHP_NEAR_52W_PCT, FHP_MAX_ABOVE_SUPPORT_PCT,
+    FHP_AT_SUPPORT_PCT,
 )
 
 
@@ -718,4 +721,162 @@ def screen_bb_squeeze(df: pd.DataFrame, timeframe: str = "daily",
         "sl_pct": sl_pct,
         "pct_from_52w_high": pct_from_52w_high,
         "timeframe": timeframe,
+    }
+
+
+# ── Fresh High Pullback (breakout -> retrace -> entry) ──────────────────────
+
+def screen_fresh_high_pullback(df: pd.DataFrame,
+                               high_lookback: int = FHP_HIGH_LOOKBACK,
+                               min_retrace_pct: float = FHP_MIN_RETRACE_PCT,
+                               max_retrace_pct: float = FHP_MAX_RETRACE_PCT,
+                               support_ema: int = FHP_SUPPORT_EMA,
+                               near_52w_pct: float = FHP_NEAR_52W_PCT,
+                               max_above_support: float = FHP_MAX_ABOVE_SUPPORT_PCT,
+                               at_support_pct: float = FHP_AT_SUPPORT_PCT,
+                               require_trend: bool = True,
+                               require_bounce: bool = False):
+    """Fresh-High-Pullback screener: buy the dip after a leadership breakout.
+
+    The setup (lower-risk than chasing a high):
+      1. Stock makes a FRESH HIGH (recent peak near the 52-week high) — a
+         genuine leader showing strength.
+      2. Price RETRACES in a controlled way (min..max %) back toward a
+         dynamic support (the support EMA), on declining volume.
+      3. ENTRY as price holds / bounces off that support.
+
+    Statuses:
+      - PULLING BACK : retracing, not yet at support (watchlist)
+      - AT SUPPORT   : price testing the support zone (entry zone)
+      - BOUNCING     : reversal candle off support with RSI turning up (trigger)
+
+    Returns dict with metrics if the stock qualifies, else None.
+    """
+    if df is None or len(df) < EMA_LONG + high_lookback:
+        return None
+
+    close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
+    volume = df["Volume"]
+    n = len(df)
+
+    ema200 = calc_ema(close, EMA_LONG)
+    ema_sup = calc_ema(close, support_ema)
+    ema20 = calc_ema(close, 20)
+    rsi = calc_rsi(close)
+    atr = calc_atr(high, low, close)
+    avg_vol = volume.rolling(VOLUME_AVG_PERIOD).mean()
+
+    cp = float(close.iloc[-1])
+    ce200 = float(ema200.iloc[-1])
+    ce_sup = float(ema_sup.iloc[-1])
+    cur_rsi = float(rsi.iloc[-1])
+    cur_atr = float(atr.iloc[-1])
+
+    # ── Uptrend filter ──────────────────────────────────────────────────
+    if require_trend:
+        if cp <= ce200:
+            return None
+        if ce_sup <= ce200:                 # support EMA above long EMA (stacked)
+            return None
+        if n < 22 or float(ema200.iloc[-1]) <= float(ema200.iloc[-22]):
+            return None                      # 200 EMA must be rising
+
+    # ── Find the recent fresh high (peak) ───────────────────────────────
+    recent = df.tail(high_lookback)
+    peak_high = float(recent["High"].max())
+    peak_pos = df.index.get_loc(recent["High"].idxmax())
+    if isinstance(peak_pos, slice):         # safety for duplicate index
+        peak_pos = peak_pos.start
+    days_since_peak = (n - 1) - int(peak_pos)
+
+    # Peak must be a genuine fresh high: near the 52-week high
+    high_52w = float(high.max())
+    if (high_52w - peak_high) / high_52w * 100 > near_52w_pct:
+        return None
+
+    # Need at least 1 bar since the peak (so a pullback exists)
+    if days_since_peak < 1 or days_since_peak > high_lookback:
+        return None
+
+    # ── Retracement depth ───────────────────────────────────────────────
+    retrace_pct = (peak_high - cp) / peak_high * 100
+    if retrace_pct < min_retrace_pct or retrace_pct > max_retrace_pct:
+        return None
+
+    # ── Support hold ────────────────────────────────────────────────────
+    # Price must be near the support EMA — above it (or only slightly below),
+    # and not extended too far above it.
+    pct_above_support = (cp - ce_sup) / ce_sup * 100
+    if pct_above_support < -2.0:            # broke decisively below support
+        return None
+    if pct_above_support > max_above_support:  # still too far above = not at support yet
+        # allow it as PULLING BACK only if retrace is shallow; else skip
+        pass
+
+    # ── Pullback volume quality (declining = healthy) ───────────────────
+    # Compare avg volume since the peak vs the breakout volume around the peak
+    pullback_vol = float(volume.iloc[int(peak_pos):].mean())
+    peak_window = volume.iloc[max(int(peak_pos) - 3, 0):int(peak_pos) + 1]
+    breakout_vol = float(peak_window.mean()) if len(peak_window) else pullback_vol
+    vol_dryup_ratio = round(pullback_vol / breakout_vol, 2) if breakout_vol > 0 else 1.0
+
+    # ── Entry signal / status ───────────────────────────────────────────
+    near_support = abs(pct_above_support) <= at_support_pct
+    green_candle = cp > float(close.iloc[-2])
+    rsi_turning_up = cur_rsi > float(rsi.iloc[-2])
+    reclaim_ema20 = cp > float(ema20.iloc[-1]) and float(close.iloc[-2]) <= float(ema20.iloc[-2])
+
+    bouncing = near_support and (green_candle and rsi_turning_up or reclaim_ema20)
+
+    if bouncing:
+        status = "BOUNCING"
+    elif near_support:
+        status = "AT SUPPORT"
+    else:
+        status = "PULLING BACK"
+
+    if require_bounce and status != "BOUNCING":
+        return None
+
+    # ── Metrics ─────────────────────────────────────────────────────────
+    recent_20 = df.tail(VOLUME_AVG_PERIOD)
+    avg_traded_value = float((recent_20["Close"] * recent_20["Volume"]).mean())
+
+    # Stop loss: below the pullback swing low or ATR-based, whichever tighter (higher)
+    pullback_low = float(low.iloc[int(peak_pos):].min())
+    atr_sl = round(cp - ATR_SL_MULTIPLIER * cur_atr, 2)
+    swing_sl = round(pullback_low * 0.995, 2)   # a touch below the pullback low
+    stop_loss = max(atr_sl, swing_sl)
+    if stop_loss >= cp:
+        stop_loss = atr_sl
+    sl_pct = round(((cp - stop_loss) / cp) * 100, 2)
+
+    # Target = prior peak (the fresh high); R:R to that target
+    target = round(peak_high, 2)
+    upside_to_target = round((peak_high - cp) / cp * 100, 2)
+    risk = cp - stop_loss
+    rr_to_peak = round((peak_high - cp) / risk, 2) if risk > 0 else 0.0
+
+    pct_from_52w_high = round(((high_52w - cp) / high_52w) * 100, 2)
+
+    return {
+        "price": round(cp, 2),
+        "fhp_status": status,
+        "peak_high": round(peak_high, 2),
+        "days_since_peak": days_since_peak,
+        "retrace_pct": round(retrace_pct, 2),
+        "support_ema": round(ce_sup, 2),
+        "pct_above_support": round(pct_above_support, 2),
+        "vol_dryup": vol_dryup_ratio,
+        "rsi": round(cur_rsi, 2),
+        "atr": round(cur_atr, 2),
+        "target": target,
+        "upside_to_target_pct": upside_to_target,
+        "rr_to_peak": rr_to_peak,
+        "avg_traded_value": avg_traded_value,
+        "stop_loss": stop_loss,
+        "sl_pct": sl_pct,
+        "pct_from_52w_high": pct_from_52w_high,
     }

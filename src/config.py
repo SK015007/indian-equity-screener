@@ -40,6 +40,15 @@ BB_SQUEEZE_LOOKBACK_DAILY = 120   # Days to compute squeeze intensity against
 BB_SQUEEZE_LOOKBACK_WEEKLY = 26   # Weeks to compute squeeze intensity against
 BB_SQUEEZE_PERCENTILE = 20.0      # Bandwidth percentile threshold for intensity
 
+# === Fresh High Pullback (breakout -> retrace -> entry) ===
+FHP_HIGH_LOOKBACK = 45            # Days to find the recent peak (fresh) high
+FHP_MIN_RETRACE_PCT = 3.0         # Min pullback from the peak high
+FHP_MAX_RETRACE_PCT = 15.0        # Max pullback from the peak high
+FHP_SUPPORT_EMA = 50              # EMA used as dynamic support during pullback
+FHP_NEAR_52W_PCT = 8.0            # Peak must be within this % of the 52W high
+FHP_MAX_ABOVE_SUPPORT_PCT = 8.0   # Price must be within this % above support EMA
+FHP_AT_SUPPORT_PCT = 3.0          # Within this % of support EMA = "at support" zone
+
 # === Fundamental Conditions ===
 MIN_MARKET_CAP_CR = 1000       # Minimum market cap in crores (₹)
 MIN_SALES_GROWTH_PCT = 10.0    # Minimum YoY sales growth %
